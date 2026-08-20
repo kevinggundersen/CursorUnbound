@@ -140,17 +140,18 @@ namespace CursorUnbound
 		// behind our back, nothing ratchets, and both are cheap enough to call at timer rate.
 		int g_lastCursorCount = 0;
 
+		// Both of these normalize the counter to exactly 0 (shown) or -1 (hidden), whatever
+		// it was on entry and whoever moved it. Overshooting in either direction has bitten
+		// us before: a counter left at -3 needs three increments before the pointer appears,
+		// and one left high cannot be undone by a single decrement.
 		void ForceCursorShown()
 		{
 			int count = RealShowCursor(TRUE);
-			if (count > 0) {
-				// Already >= 0 before the probe. Give the increment back rather than leaving the
-				// counter high, or the bounded loop in ForceCursorHidden could never undo it.
+			for (int i = 0; i < 64 && count > 0; ++i) {
 				count = RealShowCursor(FALSE);
-			} else {
-				for (int i = 0; i < 64 && count < 0; ++i) {
-					count = RealShowCursor(TRUE);
-				}
+			}
+			for (int i = 0; i < 64 && count < 0; ++i) {
+				count = RealShowCursor(TRUE);
 			}
 			g_lastCursorCount = count;
 		}
@@ -158,12 +159,11 @@ namespace CursorUnbound
 		void ForceCursorHidden()
 		{
 			int count = RealShowCursor(FALSE);
-			if (count < -1) {
+			for (int i = 0; i < 64 && count < -1; ++i) {
 				count = RealShowCursor(TRUE);
-			} else {
-				for (int i = 0; i < 64 && count >= 0; ++i) {
-					count = RealShowCursor(FALSE);
-				}
+			}
+			for (int i = 0; i < 64 && count >= 0; ++i) {
+				count = RealShowCursor(FALSE);
 			}
 			g_lastCursorCount = count;
 		}
@@ -185,6 +185,169 @@ namespace CursorUnbound
 				return -1;
 			}
 			return RealShowCursor(a_show);
+		}
+
+		// Locates the import table slot a module uses to call a_dll!a_function.
+		//
+		// SKSE::GetIATPtr exists, but it only ever walks the game executable and logs a
+		// warning for every miss - across a few hundred loaded modules that is a few hundred
+		// warnings per launch. This also handles a null OriginalFirstThunk, which bound
+		// imports leave behind and which SKSE's version dereferences unconditionally.
+		void** FindImportSlot(HMODULE a_module, const char* a_dll, const char* a_function)
+		{
+			auto* const base = reinterpret_cast<std::uint8_t*>(a_module);
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+			if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+				return nullptr;
+			}
+
+			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+			if (nt->Signature != IMAGE_NT_SIGNATURE) {
+				return nullptr;
+			}
+
+			const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+			if (!dir.VirtualAddress || !dir.Size) {
+				return nullptr;
+			}
+
+			for (auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+				 desc->Name != 0;
+				 ++desc) {
+				const auto* name = reinterpret_cast<const char*>(base + desc->Name);
+				if (_stricmp(name, a_dll) != 0) {
+					continue;
+				}
+
+				// Bound imports zero OriginalFirstThunk, leaving FirstThunk as the only copy
+				// of the name table. It is still readable, it just doubles as the live slot.
+				const auto namesRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
+				if (!namesRva || !desc->FirstThunk) {
+					continue;
+				}
+
+				const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + namesRva);
+				auto*       slots = reinterpret_cast<void**>(base + desc->FirstThunk);
+
+				for (std::size_t i = 0; names[i].u1.AddressOfData != 0; ++i) {
+					if (IMAGE_SNAP_BY_ORDINAL64(names[i].u1.Ordinal)) {
+						continue;
+					}
+					const auto* import =
+						reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names[i].u1.AddressOfData);
+					if (std::strcmp(import->Name, a_function) == 0) {
+						return slots + i;
+					}
+				}
+			}
+
+			return nullptr;
+		}
+
+		// Redirects one module's USER32!ShowCursor import to our hook. Returns true if the
+		// module imported it at all.
+		bool PatchShowCursorIn(HMODULE a_module)
+		{
+			auto* slot = FindImportSlot(a_module, "user32.dll", "ShowCursor");
+			if (!slot || *slot == reinterpret_cast<void*>(&ShowCursorHook)) {
+				return slot != nullptr;
+			}
+
+			// The first original we see is our route to the real function. Whoever owns the
+			// slot now may itself be another mod's hook, so preferring the game executable
+			// (patched first) keeps us at the bottom of any chain rather than cutting other
+			// mods out of it.
+			if (!g_realShowCursor) {
+				g_realShowCursor = reinterpret_cast<decltype(g_realShowCursor)>(*slot);
+			}
+
+			const auto hook = reinterpret_cast<std::uintptr_t>(&ShowCursorHook);
+			REL::safe_write(reinterpret_cast<std::uintptr_t>(slot), hook);
+			return true;
+		}
+
+		std::string Narrow(const wchar_t* a_wide)
+		{
+			const int needed = ::WideCharToMultiByte(CP_UTF8, 0, a_wide, -1, nullptr, 0, nullptr, nullptr);
+			if (needed <= 1) {
+				return {};
+			}
+			std::string out(static_cast<std::size_t>(needed) - 1, '\0');
+			::WideCharToMultiByte(CP_UTF8, 0, a_wide, -1, out.data(), needed, nullptr, nullptr);
+			return out;
+		}
+
+		// True for anything living under C:\Windows. Those are excluded from the sweep: the
+		// modules we are actually after are mods, and redirecting the imports of system DLLs
+		// (or of the Steam overlay, which does its own cursor management) buys nothing and
+		// puts us in the middle of conversations we have no business in.
+		bool IsSystemModule(const wchar_t* a_path)
+		{
+			static const std::wstring windows = [] {
+				wchar_t    buffer[MAX_PATH]{};
+				const auto len = ::GetWindowsDirectoryW(buffer, MAX_PATH);
+				return (len > 0 && len < MAX_PATH) ? std::wstring(buffer, len) : std::wstring{};
+			}();
+
+			if (windows.empty()) {
+				return false;
+			}
+
+			const auto len = static_cast<int>(windows.size());
+			if (static_cast<int>(std::wcslen(a_path)) < len) {
+				return false;
+			}
+			return ::CompareStringOrdinal(a_path, len, windows.c_str(), len, TRUE) == CSTR_EQUAL;
+		}
+
+		// The game executable is not the only thing calling ShowCursor. SSEDisplayTweaks in
+		// particular drives cursor visibility for its borderless window, and its calls come
+		// from its own import table - which is why a session could end up with the display
+		// counter at -3 while we believed we had forced the pointer visible.
+		//
+		// Run once every SKSE plugin is loaded, so the sweep sees them.
+		void PatchShowCursorEverywhere()
+		{
+			HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, ::GetCurrentProcessId());
+			if (snapshot == INVALID_HANDLE_VALUE) {
+				SKSE::log::warn("Could not enumerate loaded modules; only the game import table is hooked.");
+				return;
+			}
+
+			HMODULE self = nullptr;
+			::GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				reinterpret_cast<LPCWSTR>(&ShowCursorHook),
+				&self);
+
+			const HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
+
+			int         patched = 0;
+			std::string names;
+
+			MODULEENTRY32W entry{};
+			entry.dwSize = sizeof(entry);
+			if (::Module32FirstW(snapshot, &entry)) {
+				do {
+					// Skipping ourselves keeps RealShowCursor's ::ShowCursor fallback from
+					// re-entering the hook if the slot capture above ever came up empty.
+					if (entry.hModule == self || entry.hModule == user32 ||
+						IsSystemModule(entry.szExePath)) {
+						continue;
+					}
+					if (PatchShowCursorIn(entry.hModule)) {
+						++patched;
+						if (!names.empty()) {
+							names += ", ";
+						}
+						names += Narrow(entry.szModule);
+					}
+				} while (::Module32NextW(snapshot, &entry));
+			}
+
+			::CloseHandle(snapshot);
+
+			SKSE::log::info("Patched USER32!ShowCursor in {} module(s): {}", patched, names);
 		}
 
 		// ---------------------------------------------------------------------------
@@ -430,27 +593,40 @@ namespace CursorUnbound
 			}
 			++emitted;
 
-			std::string openMenus;
+			// Every live menu object, tagged with the two things the activation decision reads:
+			// '*' for on the stack (i.e. genuinely open), '+' for carrying kUsesCursor. An
+			// untagged or '+'-only entry is a menu that exists but is closed - which is exactly
+			// the case that used to keep the pointer on screen for a whole session.
+			std::string menus;
 			if (auto* ui = RE::UI::GetSingleton()) {
 				for (const auto& entry : ui->menuMap) {
-					if (entry.second.menu) {
-						if (!openMenus.empty()) {
-							openMenus += ", ";
-						}
-						openMenus += entry.first.c_str();
+					const auto& menu = entry.second.menu;
+					if (!menu) {
+						continue;
+					}
+					if (!menus.empty()) {
+						menus += ", ";
+					}
+					menus += entry.first.c_str();
+					if (menu->OnStack()) {
+						menus += '*';
+					}
+					if (menu->menuFlags.all(RE::UI_MENU_FLAGS::kUsesCursor)) {
+						menus += '+';
 					}
 				}
 			}
 
 			SKSE::log::info(
 				"[diag] activations={} hides={} cursorMovieWasVisibleOnEntry={} wasHidden={} "
-				"lastMovie=0x{:X} | menus: {}",
+				"lastMovie=0x{:X} showCursorCount={} | menus (*=on stack, +=uses cursor): {}",
 				g_stats.activations,
 				g_stats.entryVisible + g_stats.entryHidden,
 				g_stats.entryVisible,
 				g_stats.entryHidden,
 				g_stats.lastMovie,
-				openMenus.empty() ? "<none>" : openMenus);
+				g_lastCursorCount,
+				menus.empty() ? "<none>" : menus);
 		}
 
 		// The game re-shows its cursor on some menu transitions, so re-assert periodically
@@ -656,11 +832,20 @@ namespace CursorUnbound
 		// neither depends on the player moving the mouse first.
 		constexpr UINT_PTR kSyncTimerId = 0xC0DE;
 
-		// Menu open/close events are the primary activation signal, but they are not
-		// sufficient on their own. The Cursor Menu can already be open before our sink is
-		// registered, and the events only ever describe the Cursor Menu itself - some menus
-		// take the pointer without it appearing in the map at all. So derive the answer from
-		// the live menu state rather than trusting the event stream.
+		// The live menu state is what decides this, not the event stream: the Cursor Menu can
+		// already be open before our sink is registered, and the events only ever describe
+		// the Cursor Menu itself - some menus take the pointer without it appearing at all.
+		//
+		// The one thing the live state cannot tell us is that a menu is *about* to open. The
+		// Cursor Menu's open event arrives a frame or two before the menu reaches the stack,
+		// so IsMenuOpen still answers false at that point. Acting on the event alone and
+		// letting the poll correct it a moment later is what produced a hide and re-show
+		// within 3ms of every menu opening; this bridges the gap instead. It expires on its
+		// own, so a missed close event cannot latch the plugin on.
+		std::atomic<std::uint64_t> g_cursorMenuOpenHint{ 0 };  // tick, 0 = no hint
+
+		constexpr std::uint64_t kOpenHintLifetimeMs = 1000;
+
 		bool MenusWantCursor()
 		{
 			auto* ui = RE::UI::GetSingleton();
@@ -669,6 +854,13 @@ namespace CursorUnbound
 			}
 
 			if (ui->IsMenuOpen(RE::CursorMenu::MENU_NAME)) {
+				// The real state has caught up, so stop trusting the hint from here on.
+				g_cursorMenuOpenHint.store(0, std::memory_order_relaxed);
+				return true;
+			}
+
+			const auto hint = g_cursorMenuOpenHint.load(std::memory_order_relaxed);
+			if (hint && ::GetTickCount64() - hint < kOpenHintLifetimeMs) {
 				return true;
 			}
 
@@ -676,11 +868,17 @@ namespace CursorUnbound
 			// the main menu at startup being the one everybody hits. Always-open menus (the
 			// HUD) are skipped so this cannot latch on during normal gameplay.
 			//
+			// OnStack is the part that makes this safe: a non-null entry in menuMap only means
+			// the menu object exists, not that it is open (UI::IsMenuOpen is
+			// `menu && menu->OnStack()`). Without it, one instantiated-but-closed menu
+			// carrying kUsesCursor keeps the pointer on screen for the rest of the session.
+			//
 			// Read kUsesCursor off menuFlags directly: IMenu::UsesCursor() in CommonLibSSE-NG
 			// tests kUsesMenuContext, one of a run of five accessors bound to the wrong flag.
 			for (const auto& entry : ui->menuMap) {
 				const auto& menu = entry.second.menu;
-				if (menu && !menu->AlwaysOpen() && menu->menuFlags.all(RE::UI_MENU_FLAGS::kUsesCursor)) {
+				if (menu && menu->OnStack() && !menu->AlwaysOpen() &&
+					menu->menuFlags.all(RE::UI_MENU_FLAGS::kUsesCursor)) {
 					return true;
 				}
 			}
@@ -710,7 +908,51 @@ namespace CursorUnbound
 			}
 		}
 
-		void SyncActiveState()
+		// The exact mirror of AssertCursorState, and the fix for the pointer that stayed on
+		// screen after a menu closed.
+		//
+		// The display counter is process-wide and everything writes to it: the game, other
+		// SKSE plugins, SSEDisplayTweaks for its borderless window. Hiding once in Deactivate
+		// left any later ShowCursor(TRUE) permanently unanswered, because every re-assertion
+		// we had was gated on being active. Alt-tabbing out and back was the only cure, and
+		// only because the game re-runs its own hide path on focus regain.
+		//
+		// ForceCursorHidden normalizes to exactly -1 and is idempotent from there - it probes
+		// to -2 and restores - so this is safe to run forever at a low rate.
+		void AssertCursorHidden()
+		{
+			const auto& config = Config::Get();
+			if (!config.enforceHiddenWhenInactive || !config.useHardwareCursor) {
+				return;
+			}
+
+			// Only while the cursor is not ours to show. Gamepad mode counts as not ours: the
+			// game draws its own pointer there and wants the OS one gone.
+			if (g_active.load(std::memory_order_relaxed) &&
+				!g_gamepadMode.load(std::memory_order_relaxed)) {
+				return;
+			}
+
+			// Nothing to undo until we have actually shown the cursor at least once. Before
+			// that, leaving the counter alone keeps us out of the way of mods that legitimately
+			// want a pointer during gameplay.
+			if (g_stats.activations == 0) {
+				return;
+			}
+
+			static std::uint64_t lastTick = 0;
+			const auto           now = ::GetTickCount64();
+			if (now - lastTick < 250) {
+				return;
+			}
+			lastTick = now;
+
+			ForceCursorHidden();
+		}
+
+		// a_force bypasses the throttle, for the callers that are reacting to a menu event
+		// rather than polling.
+		void SyncActiveState(bool a_force = false)
 		{
 			if (!g_runtimeReady.load(std::memory_order_relaxed) || !Config::Get().enabled) {
 				return;
@@ -718,7 +960,7 @@ namespace CursorUnbound
 
 			static std::uint64_t lastTick = 0;
 			const auto           now = ::GetTickCount64();
-			if (now - lastTick < 32) {
+			if (!a_force && now - lastTick < 32) {
 				return;
 			}
 			lastTick = now;
@@ -748,6 +990,7 @@ namespace CursorUnbound
 					SyncActiveState();
 					if (!g_window || ::GetForegroundWindow() == g_window) {
 						AssertCursorState();
+						AssertCursorHidden();
 					}
 					return 0;
 				}
@@ -758,6 +1001,7 @@ namespace CursorUnbound
 				// every move if something else in the process answers it first.
 				SyncActiveState();
 				AssertCursorState();
+				AssertCursorHidden();
 				break;
 
 			case WM_SETCURSOR:
@@ -1111,6 +1355,7 @@ namespace CursorUnbound
 		SKSE::log::info("Hooked CursorMenu::ProcessMouseMove and ProcessThumbstick.");
 
 		if (Config::Get().blockGameCursorHide) {
+			// The executable first, so its original is the one we keep as the real function.
 			const auto original = SKSE::PatchIAT(&ShowCursorHook, "user32.dll", "ShowCursor");
 			if (original) {
 				g_realShowCursor = reinterpret_cast<decltype(g_realShowCursor)>(original);
@@ -1125,6 +1370,12 @@ namespace CursorUnbound
 
 	void InitializeRuntime()
 	{
+		// Deferred to kDataLoaded rather than done alongside the executable patch above, so
+		// the sweep sees every SKSE plugin that will ever be loaded.
+		if (Config::Get().blockGameCursorHide && Config::Get().hookAllModules) {
+			PatchShowCursorEverywhere();
+		}
+
 		ResolveGameWindow();
 		LoadCursorArt();
 		HookWindowProc();
@@ -1133,9 +1384,7 @@ namespace CursorUnbound
 
 		// A menu may already be up when we initialise. Usually one is not: kDataLoaded fires
 		// before the main menu appears, which is why the sync timer has to exist.
-		if (MenusWantCursor()) {
-			Activate();
-		}
+		SyncActiveState(true);
 	}
 
 	void Shutdown()
@@ -1170,11 +1419,12 @@ namespace CursorUnbound
 		}
 
 		if (a_menuName == RE::CursorMenu::MENU_NAME) {
-			if (a_opening) {
-				Activate();
-			} else {
-				Deactivate();
-			}
+			// The event is a hint, not the decision. SyncActiveState is the single decider so
+			// that the event and the sync timer cannot disagree and flip the cursor twice in
+			// the same frame - which is what every Activated/Deactivated/Activated triple in a
+			// 1.0.1 log was.
+			g_cursorMenuOpenHint.store(a_opening ? ::GetTickCount64() : 0, std::memory_order_relaxed);
+			SyncActiveState(true);
 			return;
 		}
 

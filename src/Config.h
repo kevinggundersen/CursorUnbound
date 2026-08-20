@@ -53,6 +53,15 @@ namespace CursorUnbound
 		bool            neutralizeGameDelta = true;
 		bool            clipToWindow = true;
 		bool            blockGameCursorHide = true;
+		// Keep re-hiding the OS cursor while no menu wants it. The display counter is a
+		// process-wide resource that the game, SSEDisplayTweaks and other SKSE plugins all
+		// write to, so hiding once on menu close is not enough - a single stray
+		// ShowCursor(TRUE) afterwards strands the pointer on screen for the rest of the
+		// session.
+		bool            enforceHiddenWhenInactive = true;
+		// Patch USER32!ShowCursor in every loaded module's import table, not just the game
+		// executable's. Without this, hide calls coming from another DLL bypass the hook.
+		bool            hookAllModules = true;
 		bool            syncOnMenuOpen = true;
 		CoordinateSpace coordinateSpace = CoordinateSpace::kAuto;
 		// Manual escape hatch. When > 0 these override whatever the coordinate space

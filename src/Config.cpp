@@ -161,6 +161,10 @@ namespace CursorUnbound
 					clipToWindow = ParseBool(value, clipToWindow);
 				} else if (key == "blockgamecursorhide") {
 					blockGameCursorHide = ParseBool(value, blockGameCursorHide);
+				} else if (key == "enforcehiddenwheninactive") {
+					enforceHiddenWhenInactive = ParseBool(value, enforceHiddenWhenInactive);
+				} else if (key == "hookallmodules") {
+					hookAllModules = ParseBool(value, hookAllModules);
 				} else if (key == "synconmenuopen") {
 					syncOnMenuOpen = ParseBool(value, syncOnMenuOpen);
 				} else if (key == "coordinatespace") {

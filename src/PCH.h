@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -27,5 +28,8 @@
 #include <spdlog/sinks/basic_file_sink.h>
 
 #include <Windows.h>
+
+// Module enumeration for the ShowCursor import-table sweep. Needs Windows.h first.
+#include <TlHelp32.h>
 
 using namespace std::literals;

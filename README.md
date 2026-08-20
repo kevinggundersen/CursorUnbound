@@ -107,6 +107,8 @@ See the comments in `CursorUnbound.ini`. The settings most worth knowing:
 | `CoordinateSpace` | Leave on `auto` unless the cursor is visually offset from where clicks land. |
 | `LogCursorRange` | Diagnostic. Logs the coordinate range the game itself produces. |
 | `BlockGameCursorHide` | Stops the game re-hiding the OS cursor. Disable if it fights another mod. |
+| `HookAllModules` | Also intercepts `ShowCursor` calls from other DLLs (SSEDisplayTweaks, other SKSE plugins), not just the game executable. Turn off if another cursor mod stops working. |
+| `EnforceHiddenWhenInactive` | Keeps re-hiding the OS cursor while no menu wants it, rather than hiding it once on menu close. Turn off if a mod that wants a pointer during gameplay cannot show one. |
 
 Logs go to `Documents\My Games\Skyrim Special Edition\SKSE\CursorUnbound.log`.
 
@@ -131,6 +133,15 @@ first — it is the simpler fix.
 **Cursor flickers on menu transitions.** Make sure `BlockGameCursorHide = true`. If the
 log says `USER32!ShowCursor is not in the game's import table`, the plugin is falling back
 to `WM_SETCURSOR`, which is more flicker-prone.
+
+**Cursor stays on screen after you close a menu, and only alt-tabbing out and back clears
+it.** This was a bug in 1.0.1, fixed in 1.0.2. Windows keeps one cursor display counter for
+the whole process and the game is not the only thing writing to it — 1.0.1 hooked only the
+game executable's import table and hid the pointer exactly once per menu close, so a single
+`ShowCursor(true)` from anywhere else stranded it for the rest of the session. If it recurs,
+turn on `Verbose` and check that the log's startup line reports the modules it patched;
+`EnforceHiddenWhenInactive = false` will confirm whether that half of the fix is what is
+holding the cursor down.
 
 **No cursor until you alt-tab out and back.** This was a bug up to 1.0.0 and is fixed. If
 it recurs, check the log for `syncTimer=false` on the `Window procedure hooked` line - the
@@ -186,7 +197,7 @@ CommonLibSSE-NG is a submodule at `extern/CommonLibSSE-NG`.
 also packages the archive and attaches it to a draft GitHub release:
 
 ```bash
-git tag v1.0.1 && git push origin v1.0.1
+git tag v1.0.2 && git push origin v1.0.2
 ```
 
 The tag is checked against `CMakeLists.txt` and the build fails on a mismatch, so a tag
