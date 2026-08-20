@@ -132,6 +132,12 @@ first — it is the simpler fix.
 log says `USER32!ShowCursor is not in the game's import table`, the plugin is falling back
 to `WM_SETCURSOR`, which is more flicker-prone.
 
+**No cursor until you alt-tab out and back.** This was a bug up to 1.0.0 and is fixed. If
+it recurs, check the log for `syncTimer=false` on the `Window procedure hooked` line - the
+plugin could not start its message-queue timer and is back to needing mouse input before it
+notices a menu. `Activated (... showCursorCount=N)` should report `N >= 0`; a negative N
+means something is still driving the OS display counter down behind the plugin.
+
 **Conflicts.** Mods that draw their own pointer (ImGui-based overlays) or manage cursor
 visibility can fight this. Skyrim Souls RE changes which menus are open and is worth
 testing early.
@@ -167,9 +173,28 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -ModDir "E:\MO2 Mods\Cursor U
 Deploying never overwrites an existing `CursorUnbound.ini` or cursor art - updated defaults
 land beside them as `.new`. Pass `-Clean` after changing CMake options.
 
-`package.ps1` produces the release archive in `release/`.
+`package.ps1` produces the release archive in `release/`. It takes the version from
+`project(VERSION ...)` in `CMakeLists.txt`, which is the only place the version is written
+down - `main.cpp` reads it from there too, via compile definitions, for both the SKSE
+plugin record and the log banner.
 
 CommonLibSSE-NG is a submodule at `extern/CommonLibSSE-NG`.
+
+## Releasing
+
+`.github/workflows/build.yml` builds on every push and pull request, and on a `v*` tag it
+also packages the archive and attaches it to a draft GitHub release:
+
+```bash
+git tag v1.0.1 && git push origin v1.0.1
+```
+
+The tag is checked against `CMakeLists.txt` and the build fails on a mismatch, so a tag
+cannot ship an archive labelled with a different version. The release is created as a
+draft - review it and publish by hand.
+
+Nexus is not automated. Nexus Mods has no public upload API, so the archive still has to
+be uploaded there manually.
 
 ## How it works
 
@@ -177,7 +202,7 @@ CommonLibSSE-NG is a submodule at `extern/CommonLibSSE-NG`.
 | --- | --- |
 | Position | Vtable detour on `CursorMenu::ProcessMouseMove` (`VTABLE_CursorMenu[1]`, index 4). Writes `MenuCursor::cursorPosX/Y` from `GetCursorPos` **before** calling the original, with the event delta zeroed for the duration of that call and restored afterwards. |
 | Drawing | `SetVisible(false)` plus `_root._visible = false` and `_root._alpha = 0` on the Cursor Menu movie; the Win32 hardware cursor draws instead. |
-| Visibility | IAT patch on `USER32!ShowCursor` to swallow the game's hide calls, plus `WM_SETCURSOR` in a subclassed window procedure. |
+| Visibility | IAT patch on `USER32!ShowCursor` to swallow the game's hide calls, plus a 15 ms `WM_TIMER` in a subclassed window procedure that re-asserts the display counter and the cursor image. The timer is what makes this work without mouse input - `WM_SETCURSOR` only arrives once the pointer moves, so on its own it cannot bring the cursor up on a menu that just opened. |
 | Art | WIC decode to 32bpp PBGRA, `CreateIconIndirect` with an all-zero AND mask so the alpha channel drives blending. |
 | Gamepad | Vtable detour on `ProcessThumbstick` (same vtable, index 3). A stick past a deadzone hands the cursor back to the game; any real mouse delta takes it back. |
 

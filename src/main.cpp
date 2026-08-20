@@ -98,7 +98,11 @@ namespace
 }
 
 SKSEPluginInfo(
-	.Version = REL::Version{ 1, 0, 0, 0 },
+	.Version = REL::Version{
+		CURSOR_UNBOUND_VERSION_MAJOR,
+		CURSOR_UNBOUND_VERSION_MINOR,
+		CURSOR_UNBOUND_VERSION_PATCH,
+		0 },
 	.Name = "CursorUnbound"sv,
 	.Author = "kevin"sv,
 	.RuntimeCompatibility = SKSE::VersionIndependence::AddressLibrary)
@@ -113,7 +117,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	ApplyLogLevel();
 
 	SKSE::log::info(
-		"CursorUnbound 1.0.0 loading (runtime {}).",
+		"CursorUnbound " CURSOR_UNBOUND_VERSION_STRING " loading (runtime {}).",
 		a_skse->RuntimeVersion().string());
 
 	if (!CursorUnbound::Config::Get().enabled) {

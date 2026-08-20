@@ -1,0 +1,123 @@
+# Builds the plugin on every push and pull request, and attaches the release archive to a
+# GitHub release when a v* tag is pushed.
+#
+# Releasing:
+#
+#   1. bump project(VERSION ...) in CMakeLists.txt and commit
+#   2. git tag v1.0.1 && git push origin v1.0.1
+#
+# The tag is checked against CMakeLists.txt and the build fails on a mismatch, so a tag
+# can never ship an archive labelled with a different version. The release is created as a
+# DRAFT - review the notes and press publish yourself.
+#
+# Nexus is not automated: Nexus Mods has no public upload API, so the archive still has to
+# be uploaded there by hand. This workflow gets you a built, packaged, verified zip.
+
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A cold build is ~15 minutes, most of it CommonLibSSE-NG. Cancel superseded runs on a
+# branch rather than queueing them; tags are excluded so a release build always finishes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # CommonLibSSE-NG lives in extern/ as a submodule and is the bulk of the build.
+          submodules: recursive
+
+      # spdlog, fmt and rapidcsv are built from source for the static-md triplet, which is
+      # a few minutes every time without this. Keyed on vcpkg.json, so it only rebuilds
+      # when the dependency set actually changes.
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg-cache
+          key: vcpkg-x64-windows-static-md-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-x64-windows-static-md-
+
+      - name: Read version from CMakeLists.txt
+        id: version
+        shell: pwsh
+        run: |
+          $match = Select-String -Path CMakeLists.txt `
+              -Pattern '^\s*VERSION\s+(\d+\.\d+\.\d+)\s*$' | Select-Object -First 1
+          if (-not $match) { throw "Could not read VERSION from CMakeLists.txt" }
+          $version = $match.Matches[0].Groups[1].Value
+          Write-Host "CMakeLists.txt version: $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Check the tag matches CMakeLists.txt
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'.TrimStart('v')
+          $version = '${{ steps.version.outputs.version }}'
+          if ($tag -ne $version) {
+              throw "Tag v$tag does not match CMakeLists.txt version $version. " +
+                    "Bump project(VERSION ...) and re-tag."
+          }
+          Write-Host "Tag v$tag matches CMakeLists.txt."
+
+      # The runner ships vcpkg and puts CMake on PATH, so build.ps1 needs no other help.
+      # If VCPKG_INSTALLATION_ROOT is ever unset, build.ps1 falls back to its own search,
+      # which includes C:\vcpkg - where the runner's copy lives anyway.
+      - name: Build
+        shell: pwsh
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-cache
+        run: |
+          # vcpkg errors out if the binary cache directory does not already exist.
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          ./build.ps1 -VcpkgRoot $env:VCPKG_INSTALLATION_ROOT
+
+      - name: Package
+        shell: pwsh
+        run: ./package.ps1 -SkipBuild
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: CursorUnbound-${{ steps.version.outputs.version }}
+          path: release/CursorUnbound-*.zip
+          # Catches a packaging regression rather than silently producing an empty release.
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download archive
+        uses: actions/download-artifact@v4
+        with:
+          pattern: CursorUnbound-*
+          merge-multiple: true
+          path: release
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/CursorUnbound-*.zip
+          draft: true
+          generate_release_notes: true

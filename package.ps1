@@ -6,13 +6,24 @@
 # Vortex and MO2 both accept a zip with the SKSE\Plugins layout at its root.
 
 param(
-    [string]$Version = "1.0.0",
+    [string]$Version,
     [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
 
 $root    = Split-Path -Parent $MyInvocation.MyCommand.Definition
+
+# CMakeLists.txt is the single source of truth for the version - it is what stamps the DLL
+# and what main.cpp logs - so read it from there rather than keeping a second copy here
+# that can drift and mislabel an archive.
+if (-not $Version) {
+    $match = Select-String -Path (Join-Path $root "CMakeLists.txt") `
+        -Pattern '^\s*VERSION\s+(\d+\.\d+\.\d+)\s*$' | Select-Object -First 1
+    if (-not $match) { throw "Could not read VERSION from CMakeLists.txt" }
+    $Version = $match.Matches[0].Groups[1].Value
+}
+
 $dist    = Join-Path $root "dist"
 $release = Join-Path $root "release"
 $stage   = Join-Path $release "stage"

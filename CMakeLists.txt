@@ -10,7 +10,7 @@ endif()
 
 project(
 	CursorUnbound
-	VERSION 1.0.0
+	VERSION 1.0.1
 	DESCRIPTION "Decouples the Skyrim menu cursor from the game frame rate."
 	LANGUAGES CXX RC
 )
@@ -57,6 +57,9 @@ add_library("${PROJECT_NAME}" SHARED ${SOURCES} "${CMAKE_CURRENT_BINARY_DIR}/ver
 
 target_compile_features("${PROJECT_NAME}" PRIVATE cxx_std_23)
 
+# The version lives in project() above and nowhere else. main.cpp reads it from here for
+# both the SKSE plugin record and the log banner, and package.ps1 parses it out of this
+# file, so a release archive can never end up labelled differently from the DLL inside it.
 target_compile_definitions(
 	"${PROJECT_NAME}"
 	PRIVATE
@@ -64,6 +67,10 @@ target_compile_definitions(
 		_UNICODE
 		NOMINMAX
 		WIN32_LEAN_AND_MEAN
+		CURSOR_UNBOUND_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+		CURSOR_UNBOUND_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+		CURSOR_UNBOUND_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+		CURSOR_UNBOUND_VERSION_STRING="${PROJECT_VERSION}"
 )
 
 target_include_directories("${PROJECT_NAME}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

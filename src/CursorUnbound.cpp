@@ -127,59 +127,45 @@ namespace CursorUnbound
 			return g_realShowCursor ? g_realShowCursor(a_show) : ::ShowCursor(a_show);
 		}
 
-		// ShowCursor mutates the counter on every call, including calls that do not change
-		// the visible state. Since ForceCursorShown runs from WM_SETCURSOR - i.e. on every
-		// mouse move over the window - blindly calling ShowCursor(TRUE) would ratchet the
-		// counter up without bound, and the bounded restore below would then never get it
-		// back down. So query the state first and only touch the counter when it must move.
-		bool IsCursorCurrentlyShown()
-		{
-			CURSORINFO info{};
-			info.cbSize = sizeof(info);
-			if (!::GetCursorInfo(&info)) {
-				return false;
-			}
-			return (info.flags & CURSOR_SHOWING) != 0;
-		}
-
-		// Whether we are the ones currently holding the counter up.
-		bool g_cursorShownByUs = false;
+		// ShowCursor returns the NEW value of the display counter, and that return value is
+		// the only trustworthy read of it. GetCursorInfo reports the SYSTEM cursor state, and
+		// on the main menu and immediately after alt-tab that reads as "showing" while this
+		// queue's counter is still negative. A cached "we already showed it" flag guarded by
+		// GetCursorInfo could therefore latch on while the pointer was in fact invisible and
+		// then skip the one call that would have revealed it - which is what left alt-tabbing
+		// out and back as the only way to get a cursor.
+		//
+		// So probe with a real call and hand the increment straight back when it was not
+		// needed. The counter lands on exactly 0 (visible) or -1 (hidden) whatever moved it
+		// behind our back, nothing ratchets, and both are cheap enough to call at timer rate.
+		int g_lastCursorCount = 0;
 
 		void ForceCursorShown()
 		{
-			// Both signals are needed and neither is sufficient alone.
-			//
-			// GetCursorInfo reports the SYSTEM cursor state, not this thread's ShowCursor
-			// counter. On the main menu and immediately after alt-tab the cursor reads as
-			// "showing" while the game's counter is still negative, so testing it alone made
-			// us skip the call that actually reveals the cursor - and with the Scaleform
-			// cursor suppressed that left no cursor at all.
-			//
-			// Our own flag is what stops the counter ratcheting up on every mouse move.
-			if (g_cursorShownByUs && IsCursorCurrentlyShown()) {
-				return;
-			}
-
-			// Bounded so a runaway counter cannot spin us forever.
-			for (int i = 0; i < 64; ++i) {
-				if (RealShowCursor(TRUE) >= 0) {
-					break;
+			int count = RealShowCursor(TRUE);
+			if (count > 0) {
+				// Already >= 0 before the probe. Give the increment back rather than leaving the
+				// counter high, or the bounded loop in ForceCursorHidden could never undo it.
+				count = RealShowCursor(FALSE);
+			} else {
+				for (int i = 0; i < 64 && count < 0; ++i) {
+					count = RealShowCursor(TRUE);
 				}
 			}
-			g_cursorShownByUs = true;
+			g_lastCursorCount = count;
 		}
 
 		void ForceCursorHidden()
 		{
-			if (!g_cursorShownByUs && !IsCursorCurrentlyShown()) {
-				return;
-			}
-			g_cursorShownByUs = false;
-			for (int i = 0; i < 64; ++i) {
-				if (RealShowCursor(FALSE) < 0) {
-					return;
+			int count = RealShowCursor(FALSE);
+			if (count < -1) {
+				count = RealShowCursor(TRUE);
+			} else {
+				for (int i = 0; i < 64 && count >= 0; ++i) {
+					count = RealShowCursor(FALSE);
 				}
 			}
+			g_lastCursorCount = count;
 		}
 
 		// Replaces USER32!ShowCursor in the game's import table. While we own the cursor we
@@ -666,11 +652,64 @@ namespace CursorUnbound
 		// Window procedure
 		// ---------------------------------------------------------------------------
 
+		// Drives SyncActiveState/AssertCursorState from the window's own message queue, so
+		// neither depends on the player moving the mouse first.
+		constexpr UINT_PTR kSyncTimerId = 0xC0DE;
+
 		// Menu open/close events are the primary activation signal, but they are not
-		// sufficient on their own: the Cursor Menu can already be open before our sink is
-		// registered, which is why there was no cursor on the main menu until a save was
-		// loaded. Polling the actual menu state from the window procedure - which always
-		// runs - closes that gap regardless of event timing.
+		// sufficient on their own. The Cursor Menu can already be open before our sink is
+		// registered, and the events only ever describe the Cursor Menu itself - some menus
+		// take the pointer without it appearing in the map at all. So derive the answer from
+		// the live menu state rather than trusting the event stream.
+		bool MenusWantCursor()
+		{
+			auto* ui = RE::UI::GetSingleton();
+			if (!ui) {
+				return false;
+			}
+
+			if (ui->IsMenuOpen(RE::CursorMenu::MENU_NAME)) {
+				return true;
+			}
+
+			// Fallback for menus that drive the pointer without the Cursor Menu being open -
+			// the main menu at startup being the one everybody hits. Always-open menus (the
+			// HUD) are skipped so this cannot latch on during normal gameplay.
+			//
+			// Read kUsesCursor off menuFlags directly: IMenu::UsesCursor() in CommonLibSSE-NG
+			// tests kUsesMenuContext, one of a run of five accessors bound to the wrong flag.
+			for (const auto& entry : ui->menuMap) {
+				const auto& menu = entry.second.menu;
+				if (menu && !menu->AlwaysOpen() && menu->menuFlags.all(RE::UI_MENU_FLAGS::kUsesCursor)) {
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		// Re-applies the two things that do not stay applied on their own: the OS display
+		// counter, which the game keeps pushing negative, and the cursor image, which
+		// DefWindowProc resets to the window class cursor - null, for Skyrim - on every
+		// WM_SETCURSOR we do not answer ourselves.
+		//
+		// Idempotent and cheap, so it can run from the sync timer as well as from mouse
+		// messages. Running it off the timer is the point: mouse messages only arrive once
+		// the player moves the mouse, and at the main menu the mouse is usually still.
+		void AssertCursorState()
+		{
+			if (!g_active.load(std::memory_order_relaxed) ||
+				!Config::Get().useHardwareCursor ||
+				g_gamepadMode.load(std::memory_order_relaxed)) {
+				return;
+			}
+
+			ForceCursorShown();
+			if (HCURSOR cursor = g_customCursor ? g_customCursor : g_fallbackCursor) {
+				::SetCursor(cursor);
+			}
+		}
+
 		void SyncActiveState()
 		{
 			if (!g_runtimeReady.load(std::memory_order_relaxed) || !Config::Get().enabled) {
@@ -679,25 +718,19 @@ namespace CursorUnbound
 
 			static std::uint64_t lastTick = 0;
 			const auto           now = ::GetTickCount64();
-			if (now - lastTick < 100) {
+			if (now - lastTick < 32) {
 				return;
 			}
 			lastTick = now;
 
-			auto* ui = RE::UI::GetSingleton();
-			if (!ui) {
-				return;
-			}
-
 			// Emitted from here as well as from the mouse hook, so the menu list is still
-			// captured while inactive - which is the state to inspect if the main menu ends
-			// up with no cursor again.
+			// captured while inactive - which is the state to inspect if a menu ever ends up
+			// with no cursor again.
 			LogDiagnosticSummary();
 
-			const bool shouldBeActive = ui->IsMenuOpen(RE::CursorMenu::MENU_NAME);
+			const bool shouldBeActive = MenusWantCursor();
 			const bool isActive = g_active.load(std::memory_order_relaxed);
 			if (shouldBeActive && !isActive) {
-				SKSE::log::info("Activating from state poll (menu event was missed).");
 				Activate();
 			} else if (!shouldBeActive && isActive) {
 				Deactivate();
@@ -707,20 +740,30 @@ namespace CursorUnbound
 		LRESULT CALLBACK WndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wparam, LPARAM a_lparam)
 		{
 			switch (a_msg) {
+			case WM_TIMER:
+				// The only assertion point here that does not depend on mouse input. Without it
+				// a menu that opens while the mouse is still - the main menu at startup, most
+				// obviously - has nothing to bring the pointer up.
+				if (a_wparam == kSyncTimerId) {
+					SyncActiveState();
+					if (!g_window || ::GetForegroundWindow() == g_window) {
+						AssertCursorState();
+					}
+					return 0;
+				}
+				break;
+
 			case WM_MOUSEMOVE:
 				// Re-assert the image here too. WM_SETCURSOR is not guaranteed to arrive on
 				// every move if something else in the process answers it first.
 				SyncActiveState();
-				if (g_active.load(std::memory_order_relaxed) && Config::Get().useHardwareCursor &&
-					!g_gamepadMode.load(std::memory_order_relaxed)) {
-					::SetCursor(g_customCursor ? g_customCursor : g_fallbackCursor);
-				}
+				AssertCursorState();
 				break;
 
 			case WM_SETCURSOR:
-				// The game does not handle WM_SETCURSOR itself, so this is where we get to
-				// name the cursor image. It arrives at OS mouse-event rate, which also makes
-				// it a convenient place to keep re-asserting visibility.
+				// The game does not handle WM_SETCURSOR itself, so this is where we get to name
+				// the cursor image. Answering it rather than falling through to DefWindowProc
+				// is what stops the window class cursor being applied over ours a moment later.
 				SyncActiveState();
 				if (g_active.load(std::memory_order_relaxed) && Config::Get().useHardwareCursor &&
 					!g_gamepadMode.load(std::memory_order_relaxed) && LOWORD(a_lparam) == HTCLIENT) {
@@ -737,23 +780,21 @@ namespace CursorUnbound
 
 			case WM_ACTIVATE:
 			case WM_ACTIVATEAPP:
-				if (g_active.load(std::memory_order_relaxed)) {
+				{
 					const bool activating = (a_msg == WM_ACTIVATE)
 						? (LOWORD(a_wparam) != WA_INACTIVE)
 						: (a_wparam != FALSE);
 					if (activating) {
-						ApplyClip(Config::Get().clipToWindow);
-						if (Config::Get().useHardwareCursor) {
-							// Focus loss can leave the game's counter somewhere we did not
-							// put it, so drop our claim and genuinely re-apply rather than
-							// letting ForceCursorShown decide it has nothing to do.
-							g_cursorShownByUs = false;
-							ForceCursorShown();
-							::SetCursor(g_customCursor ? g_customCursor : g_fallbackCursor);
+						// Synced unconditionally rather than only when already active: coming back
+						// to the window is exactly when a menu we never saw open has to be picked
+						// up.
+						SyncActiveState();
+						if (g_active.load(std::memory_order_relaxed)) {
+							ApplyClip(Config::Get().clipToWindow);
+							AssertCursorState();
 						}
-					} else {
+					} else if (g_active.load(std::memory_order_relaxed)) {
 						::ClipCursor(nullptr);
-						g_cursorShownByUs = false;
 					}
 				}
 				break;
@@ -802,7 +843,23 @@ namespace CursorUnbound
 			}
 
 			g_originalWndProc = reinterpret_cast<WNDPROC>(previous);
-			SKSE::log::info("Window procedure hooked (hwnd={}, unicode={}).", static_cast<void*>(hwnd), g_windowIsUnicode);
+
+			// ~60 Hz. WM_TIMER is the lowest-priority message there is, so this never competes
+			// with input or painting - it only guarantees us a look in every frame or so even
+			// when no mouse messages are being generated at all.
+			const bool timerOk = ::SetTimer(hwnd, kSyncTimerId, 15, nullptr) != 0;
+
+			SKSE::log::info(
+				"Window procedure hooked (hwnd={}, unicode={}, syncTimer={}).",
+				static_cast<void*>(hwnd),
+				g_windowIsUnicode,
+				timerOk);
+			if (!timerOk) {
+				SKSE::log::warn(
+					"Could not start the sync timer (error {}); menus will only pick the cursor up "
+					"once the mouse moves.",
+					::GetLastError());
+			}
 		}
 
 		// ---------------------------------------------------------------------------
@@ -892,10 +949,11 @@ namespace CursorUnbound
 			ApplyClip(config.clipToWindow);
 
 			++g_stats.activations;
-			SKSE::log::debug(
-				"Activated (hardwareCursor={}, customArt={}).",
+			SKSE::log::info(
+				"Activated (hardwareCursor={}, customArt={}, showCursorCount={}).",
 				config.useHardwareCursor,
-				g_customCursor != nullptr);
+				g_customCursor != nullptr,
+				g_lastCursorCount);
 		}
 
 		void Deactivate()
@@ -917,7 +975,7 @@ namespace CursorUnbound
 				ClearSuppressedMovie();
 			}
 
-			SKSE::log::debug("Deactivated.");
+			SKSE::log::info("Deactivated (showCursorCount={}).", g_lastCursorCount);
 		}
 
 		// ---------------------------------------------------------------------------
@@ -1073,9 +1131,9 @@ namespace CursorUnbound
 
 		g_runtimeReady.store(true);
 
-		// A menu may already be up when we initialise (e.g. the main menu).
-		auto* ui = RE::UI::GetSingleton();
-		if (ui && ui->IsMenuOpen(RE::CursorMenu::MENU_NAME)) {
+		// A menu may already be up when we initialise. Usually one is not: kDataLoaded fires
+		// before the main menu appears, which is why the sync timer has to exist.
+		if (MenusWantCursor()) {
 			Activate();
 		}
 	}
@@ -1083,6 +1141,10 @@ namespace CursorUnbound
 	void Shutdown()
 	{
 		Deactivate();
+
+		if (g_window && ::IsWindow(g_window)) {
+			::KillTimer(g_window, kSyncTimerId);
+		}
 
 		if (g_originalWndProc && g_window && ::IsWindow(g_window)) {
 			if (g_windowIsUnicode) {
