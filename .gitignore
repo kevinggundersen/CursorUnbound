@@ -1,0 +1,20 @@
+# Build output
+build/
+release/
+vcpkg_installed/
+
+# The staged DLL is a build artifact; the ini and cursor art in dist/ are sources.
+dist/SKSE/Plugins/CursorUnbound.dll
+
+# Deploy leftovers
+*.new
+*.bak
+
+# One-off local migration script with machine-specific paths (FreeCursor -> Cursor Unbound)
+migrate_mod_folder.ps1
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+CMakeSettings.json

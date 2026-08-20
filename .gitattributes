@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.ps1  text eol=crlf
+*.ini  text eol=crlf
+*.rc   text eol=crlf
+*.in   text eol=crlf
+
+*.png  binary
+*.dll  binary
+*.zip  binary
