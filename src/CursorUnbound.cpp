@@ -391,6 +391,266 @@ namespace CursorUnbound
 		}
 
 		// ---------------------------------------------------------------------------
+		// PrismaUI cursor suppression
+		//
+		// PrismaUI draws its own cursor: a DirectX sprite, blitted in the render loop from
+		// MenuCursor::cursorPosX/Y by PrismaUI::ViewRenderer::DrawCursor. It is neither a
+		// Scaleform movie nor an HTML element, so nothing else in this file can reach it, and
+		// because it is drawn inside the frame it trails the hardware cursor by a frame or
+		// more. Both on screen at once is the "double cursor" report from Prisma menus.
+		//
+		// Their cursor cannot simply be displaced instead: their input handler reads the same
+		// MenuCursor fields to place mouse events, so anything that moves the sprite out of
+		// the way also breaks hovering and clicking.
+		//
+		// DrawCursor takes no arguments, returns void, and already opens with its own
+		// early-outs (null sprite batch or texture, no active input capture). Writing a single
+		// RET over its first byte is therefore a complete and correct suppression - it returns
+		// before establishing a frame, so the /GS cookie and the unwind funclet are never
+		// reached - and writing the original byte back restores it exactly.
+		//
+		// None of this makes PrismaUI a dependency. If the module is not loaded, or the
+		// signature does not match exactly one location, this does nothing at all.
+		// ---------------------------------------------------------------------------
+
+		constexpr std::uint8_t kRetOpcode = 0xC3;
+
+		std::uint8_t* g_prismaDrawCursor = nullptr;
+		std::uint8_t  g_prismaOriginalByte = 0;
+		bool          g_prismaPatched = false;
+
+		// PrismaUI::ViewRenderer::DrawCursor prologue:
+		//
+		//   40 56                    push rsi
+		//   57                       push rdi
+		//   48 81 EC 28 02 00 00     sub  rsp, 0x228
+		//   48 8B 05 ?? ?? ?? ??     mov  rax, [rip+__security_cookie]
+		//   48 33 C4                 xor  rax, rsp
+		//   48 89 84 24 10 02 00 00  mov  [rsp+0x210], rax
+		//
+		// The RIP displacement is wildcarded because it moves with every build; the 0x228
+		// frame and the cookie slot at 0x210 are what make this specific. Verified unique
+		// across the whole .text section of the PrismaUI.dll this was developed against, where
+		// the function sits at +0x922C0. Re-check against every new PrismaUI release - a stale
+		// signature is meant to match nothing rather than match the wrong thing.
+		constexpr int kDrawCursorSig[] = {
+			0x40, 0x56, 0x57, 0x48, 0x81, 0xEC, 0x28, 0x02, 0x00, 0x00,
+			0x48, 0x8B, 0x05,   -1,   -1,   -1,   -1,
+			0x48, 0x33, 0xC4,
+			0x48, 0x89, 0x84, 0x24, 0x10, 0x02, 0x00, 0x00,
+		};
+
+		bool GetTextSection(HMODULE a_module, std::uint8_t*& a_outBegin, std::size_t& a_outSize)
+		{
+			auto* const base = reinterpret_cast<std::uint8_t*>(a_module);
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+			if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+				return false;
+			}
+
+			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+			if (nt->Signature != IMAGE_NT_SIGNATURE) {
+				return false;
+			}
+
+			const auto* section = IMAGE_FIRST_SECTION(nt);
+			for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+				if (std::memcmp(section->Name, ".text", 5) == 0) {
+					a_outBegin = base + section->VirtualAddress;
+					a_outSize = section->Misc.VirtualSize;
+					return true;
+				}
+			}
+			return false;
+		}
+
+		// Deliberately scans the whole range and counts every hit rather than stopping at the
+		// first. Two matches means the signature has stopped being specific enough, and that
+		// has to stay distinguishable from a clean hit - patching the first of several would
+		// be a guess.
+		std::uint8_t* FindPattern(std::uint8_t* a_begin, std::size_t a_size, const int* a_pattern,
+			std::size_t a_length, std::size_t& a_outMatches)
+		{
+			a_outMatches = 0;
+			if (!a_begin || a_size < a_length) {
+				return nullptr;
+			}
+
+			std::uint8_t* first = nullptr;
+			for (std::size_t i = 0; i <= a_size - a_length; ++i) {
+				bool matched = true;
+				for (std::size_t j = 0; j < a_length; ++j) {
+					if (a_pattern[j] >= 0 && a_begin[i + j] != static_cast<std::uint8_t>(a_pattern[j])) {
+						matched = false;
+						break;
+					}
+				}
+				if (matched && ++a_outMatches == 1) {
+					first = a_begin + i;
+				}
+			}
+			return first;
+		}
+
+		// The file version resource, when the module actually carries one. PrismaUI does not -
+		// it reports 0.0.0.0 - which is exactly why this is not the only identifier logged.
+		std::string ModuleFileVersion(HMODULE a_module)
+		{
+			wchar_t path[MAX_PATH]{};
+			if (!::GetModuleFileNameW(a_module, path, static_cast<DWORD>(std::size(path)))) {
+				return {};
+			}
+
+			DWORD       ignored = 0;
+			const DWORD size = ::GetFileVersionInfoSizeW(path, &ignored);
+			if (!size) {
+				return {};
+			}
+
+			std::vector<std::uint8_t> buffer(size);
+			if (!::GetFileVersionInfoW(path, 0, size, buffer.data())) {
+				return {};
+			}
+
+			VS_FIXEDFILEINFO* info = nullptr;
+			UINT              length = 0;
+			if (!::VerQueryValueW(buffer.data(), L"\\", reinterpret_cast<LPVOID*>(&info), &length) ||
+				!info || length < sizeof(VS_FIXEDFILEINFO)) {
+				return {};
+			}
+
+			if (!info->dwFileVersionMS && !info->dwFileVersionLS) {
+				return {};  // Present but unstamped, which is no more use than absent.
+			}
+
+			return std::format("{}.{}.{}.{}",
+				HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
+				HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
+		}
+
+		// A signature is only ever valid for the builds it was checked against, so which build
+		// we are looking at belongs in the log right next to the resolved address. Without it a
+		// silent mismatch after a PrismaUI update is indistinguishable from the feature never
+		// having worked at all.
+		//
+		// The link timestamp and image size come from the PE headers of the already-mapped
+		// module, cost nothing, and change with every rebuild - so they identify a build even
+		// for a DLL like PrismaUI that ships no version resource.
+		std::string DescribeModuleBuild(HMODULE a_module)
+		{
+			auto* const base = reinterpret_cast<std::uint8_t*>(a_module);
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+			if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+				return "<not a module>";
+			}
+
+			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+			if (nt->Signature != IMAGE_NT_SIGNATURE) {
+				return "<bad PE header>";
+			}
+
+			const auto stamp = nt->FileHeader.TimeDateStamp;
+			const auto image = nt->OptionalHeader.SizeOfImage;
+
+			char when[32] = "?";
+			auto asTime = static_cast<std::time_t>(stamp);
+			std::tm utc{};
+			if (::gmtime_s(&utc, &asTime) == 0) {
+				std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%SZ", &utc);
+			}
+
+			const auto version = ModuleFileVersion(a_module);
+			return std::format("{}build 0x{:08X} ({}), image 0x{:X}",
+				version.empty() ? "" : std::format("v{}, ", version),
+				stamp, when, image);
+		}
+
+		void ResolvePrismaDrawCursor()
+		{
+			if (g_prismaDrawCursor) {
+				return;
+			}
+
+			HMODULE module = ::GetModuleHandleW(L"PrismaUI.dll");
+			if (!module) {
+				SKSE::log::info("PrismaUI is not loaded; nothing to do about its cursor.");
+				return;
+			}
+
+			std::uint8_t* text = nullptr;
+			std::size_t   size = 0;
+			if (!GetTextSection(module, text, size)) {
+				SKSE::log::warn("PrismaUI.dll has no readable .text section; leaving its cursor alone.");
+				return;
+			}
+
+			const auto  build = DescribeModuleBuild(module);
+			std::size_t matches = 0;
+			auto*       found = FindPattern(text, size, kDrawCursorSig, std::size(kDrawCursorSig), matches);
+
+			if (matches != 1) {
+				SKSE::log::warn(
+					"PrismaUI.dll [{}] - DrawCursor signature matched {} time(s), expected exactly 1. "
+					"Leaving Prisma's cursor alone, so expect two pointers in Prisma menus. This "
+					"normally means PrismaUI has been updated and the signature needs revisiting.",
+					build, matches);
+				return;
+			}
+
+			g_prismaDrawCursor = found;
+			g_prismaOriginalByte = *found;
+			SKSE::log::info(
+				"PrismaUI.dll [{}] - resolved ViewRenderer::DrawCursor at +0x{:X} (0x{:X}).",
+				build,
+				static_cast<std::uintptr_t>(found - reinterpret_cast<std::uint8_t*>(module)),
+				reinterpret_cast<std::uintptr_t>(found));
+		}
+
+		void SetPrismaCursorSuppressed(bool a_suppress)
+		{
+			if (!g_prismaDrawCursor || g_prismaPatched == a_suppress) {
+				return;
+			}
+
+			const std::uint8_t byte = a_suppress ? kRetOpcode : g_prismaOriginalByte;
+
+			DWORD previous = 0;
+			if (!::VirtualProtect(g_prismaDrawCursor, 1, PAGE_EXECUTE_READWRITE, &previous)) {
+				SKSE::log::warn(
+					"Could not unprotect PrismaUI's DrawCursor (error {}).", ::GetLastError());
+				return;
+			}
+			*g_prismaDrawCursor = byte;
+			::VirtualProtect(g_prismaDrawCursor, 1, previous, &previous);
+			::FlushInstructionCache(::GetCurrentProcess(), g_prismaDrawCursor, 1);
+
+			g_prismaPatched = a_suppress;
+			SKSE::log::info("PrismaUI cursor sprite {}.", a_suppress ? "suppressed" : "restored");
+		}
+
+		bool WantPrismaCursorSuppressed()
+		{
+			const auto& config = Config::Get();
+			switch (config.suppressPrismaCursor) {
+			case PrismaSuppression::kOff:
+				return false;
+			case PrismaSuppression::kOn:
+				return true;
+			case PrismaSuppression::kAuto:
+			default:
+				// Only while we are the ones drawing a pointer. In gamepad mode the cursor goes
+				// back to the game, and taking Prisma's away as well would leave none at all.
+				return config.enabled && config.useHardwareCursor &&
+					   !g_gamepadMode.load(std::memory_order_relaxed);
+			}
+		}
+
+		void ApplyPrismaCursorPolicy()
+		{
+			SetPrismaCursorSuppressed(WantPrismaCursorSuppressed());
+		}
+
+		// ---------------------------------------------------------------------------
 		// Scaleform cursor
 		// ---------------------------------------------------------------------------
 
@@ -1537,9 +1797,11 @@ namespace CursorUnbound
 
 			SKSE::log::info("Gamepad cursor input detected - returning the cursor to the game.");
 
-			// Give the game its own pointer back and get ours off the screen.
+			// Give the game its own pointer back and get ours off the screen. Prisma's sprite
+			// comes back too - with no hardware cursor there is nothing for it to double up.
 			SetScaleformCursorVisible(true, false);
 			ForceCursorHidden();
+			ApplyPrismaCursorPolicy();
 		}
 
 		void ExitGamepadMode()
@@ -1549,6 +1811,8 @@ namespace CursorUnbound
 			}
 
 			SKSE::log::info("Mouse input resumed - taking the cursor back.");
+
+			ApplyPrismaCursorPolicy();
 
 			const auto& config = Config::Get();
 			if (g_active.load(std::memory_order_relaxed) && config.useHardwareCursor) {
@@ -1688,6 +1952,11 @@ namespace CursorUnbound
 		LoadCursorArt();
 		HookWindowProc();
 
+		// Independent of the window and of everything above it - kept out of HookWindowProc
+		// so a failure to find the game window does not also cost us this.
+		ResolvePrismaDrawCursor();
+		ApplyPrismaCursorPolicy();
+
 		g_runtimeReady.store(true);
 
 		// A menu may already be up when we initialise. Usually one is not: kDataLoaded fires
@@ -1698,6 +1967,10 @@ namespace CursorUnbound
 	void Shutdown()
 	{
 		Deactivate();
+
+		// Hand PrismaUI its own code back before we go, so a reloaded or unloaded plugin does
+		// not leave another mod permanently patched.
+		SetPrismaCursorSuppressed(false);
 
 		if (g_window && ::IsWindow(g_window)) {
 			::KillTimer(g_window, kSyncTimerId);

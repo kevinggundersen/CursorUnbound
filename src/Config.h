@@ -27,6 +27,17 @@ namespace CursorUnbound
 		kRender,       // skip the cursor movie's draw call outright (ignores every flag)
 	};
 
+	// Whether to neutralize PrismaUI's own cursor sprite.
+	enum class PrismaSuppression
+	{
+		// Suppress only while we are actually drawing a hardware cursor. This is the setting
+		// that avoids two pointers without taking Prisma's away from anyone who is not using
+		// ours.
+		kAuto,
+		kOn,
+		kOff,
+	};
+
 	struct Config
 	{
 		// [General]
@@ -63,6 +74,11 @@ namespace CursorUnbound
 		// executable's. Without this, hide calls coming from another DLL bypass the hook.
 		bool            hookAllModules = true;
 		bool            syncOnMenuOpen = true;
+		// PrismaUI draws its own cursor as a DirectX sprite in the render loop, positioned
+		// from MenuCursor::cursorPosX/Y. It therefore inherits our absolute position but is
+		// still drawn at frame rate, so alongside the hardware cursor it reads as a second
+		// pointer lagging the first.
+		PrismaSuppression suppressPrismaCursor = PrismaSuppression::kAuto;
 		CoordinateSpace coordinateSpace = CoordinateSpace::kAuto;
 		// Manual escape hatch. When > 0 these override whatever the coordinate space
 		// resolution would have picked.

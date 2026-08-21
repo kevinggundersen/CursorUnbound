@@ -167,6 +167,15 @@ namespace CursorUnbound
 					hookAllModules = ParseBool(value, hookAllModules);
 				} else if (key == "synconmenuopen") {
 					syncOnMenuOpen = ParseBool(value, syncOnMenuOpen);
+				} else if (key == "suppressprismacursor") {
+					const auto v = ToLower(value);
+					if (v == "on" || v == "true" || v == "1" || v == "yes") {
+						suppressPrismaCursor = PrismaSuppression::kOn;
+					} else if (v == "off" || v == "false" || v == "0" || v == "no") {
+						suppressPrismaCursor = PrismaSuppression::kOff;
+					} else {
+						suppressPrismaCursor = PrismaSuppression::kAuto;
+					}
 				} else if (key == "coordinatespace") {
 					const auto v = ToLower(value);
 					if (v == "game") {

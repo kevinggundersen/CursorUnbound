@@ -83,6 +83,7 @@ target_link_libraries(
 		CommonLibSSE::CommonLibSSE
 		windowscodecs.lib
 		Shlwapi.lib
+		Version.lib
 )
 
 if(MSVC)
