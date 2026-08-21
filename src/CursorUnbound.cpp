@@ -53,6 +53,11 @@ namespace CursorUnbound
 			std::uint64_t wmMouseMove = 0;
 			std::uint64_t wmSetCursor = 0;
 			std::uint64_t wmSetCursorAnswered = 0;
+			// The timer is the control. It is ours, it fires on a schedule rather than on
+			// input, and nothing else in the process has a reason to filter it - so a live
+			// timer alongside zero mouse messages means the messages are being eaten, while
+			// zero of both means we are off the message path altogether.
+			std::uint64_t wmTimer = 0;
 
 			void ResetPerActivation()
 			{
@@ -62,6 +67,7 @@ namespace CursorUnbound
 				wmMouseMove = 0;
 				wmSetCursor = 0;
 				wmSetCursorAnswered = 0;
+				wmTimer = 0;
 			}
 		};
 		Diagnostics g_stats;
@@ -603,22 +609,73 @@ namespace CursorUnbound
 				rootAlphaResult);
 		}
 
-		// True while our subclass is still the head of the window's procedure chain. Another
-		// module subclassing after us puts its procedure in front of ours, and it can then
-		// answer WM_SETCURSOR - or swallow mouse messages - before we ever see them. That is
-		// what "the menu shows a plain OS arrow instead of the configured art" looks like
-		// from inside this plugin.
-		bool WndProcIsOurs()
+		// Whoever currently sits at the head of the window's procedure chain.
+		//
+		// Both the A and W variants are queried deliberately. GetWindowLongPtr returns an
+		// internal translation thunk rather than the real address whenever the caller's
+		// ANSI/Unicode-ness disagrees with the window's, and the window's can change under us
+		// the moment another module subclasses with the other variant. Asking with one variant
+		// only is how this reports "not ours" for a window we are still perfectly well
+		// attached to.
+		LONG_PTR CurrentWndProc()
 		{
 			HWND hwnd = ResolveGameWindow();
-			if (!hwnd || !g_ourWndProc) {
-				return false;
+			if (!hwnd) {
+				return 0;
 			}
 
-			const auto current = g_windowIsUnicode
-				? ::GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
-				: ::GetWindowLongPtrA(hwnd, GWLP_WNDPROC);
-			return current == reinterpret_cast<LONG_PTR>(g_ourWndProc);
+			const auto ours = reinterpret_cast<LONG_PTR>(g_ourWndProc);
+			const auto ansi = ::GetWindowLongPtrA(hwnd, GWLP_WNDPROC);
+			if (ours && ansi == ours) {
+				return ansi;
+			}
+
+			const auto wide = ::GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+			if (ours && wide == ours) {
+				return wide;
+			}
+
+			// Neither matched, so report the one that is not a thunk of the other. The wide
+			// value is the more useful of the two to resolve to a module.
+			return wide ? wide : ansi;
+		}
+
+		// True while our subclass is still the head of the chain. Another module subclassing
+		// after us puts its procedure in front of ours, and it can then answer WM_SETCURSOR -
+		// or swallow mouse messages outright - before we ever see them.
+		bool WndProcIsOurs()
+		{
+			return g_ourWndProc != nullptr &&
+				   CurrentWndProc() == reinterpret_cast<LONG_PTR>(g_ourWndProc);
+		}
+
+		// Names the module that owns an address, which is the whole point of the exercise:
+		// "something subclassed after us" is not actionable, "SomePlugin.dll subclassed after
+		// us" is. GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS resolves any address inside a loaded
+		// image, and UNCHANGED_REFCOUNT keeps this from pinning the module in memory.
+		std::string ModuleNameForAddress(LONG_PTR a_address)
+		{
+			if (!a_address) {
+				return "<none>";
+			}
+
+			HMODULE module = nullptr;
+			if (!::GetModuleHandleExW(
+					GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					reinterpret_cast<LPCWSTR>(a_address),
+					&module) ||
+				!module) {
+				return "<unowned>";
+			}
+
+			wchar_t path[MAX_PATH]{};
+			if (!::GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path)))) {
+				return "<unnamed>";
+			}
+
+			const std::string full = Narrow(path);
+			const auto        slash = full.find_last_of("\\/");
+			return slash == std::string::npos ? full : full.substr(slash + 1);
 		}
 
 		// True while the shape Windows is actually drawing is the one we asked for. False with
@@ -627,6 +684,35 @@ namespace CursorUnbound
 		{
 			HCURSOR ours = g_customCursor ? g_customCursor : g_fallbackCursor;
 			return ours != nullptr && ::GetCursor() == ours;
+		}
+
+		// The SWF a movie was loaded from. GFxMovie::GetMovieDef is vfunc 01 and
+		// GFxMovieDef::GetFileURL is vfunc 0C, both stable across runtimes.
+		//
+		// This is what separates a genuine second cursor - another instance of cursormenu.swf
+		// living under a different menu name - from an ordinary menu that merely carries
+		// kUsesCursor. Journal Menu and MessageBoxMenu both set that flag and are not cursors.
+		std::string MovieSourceFile(RE::GFxMovieView* a_movie)
+		{
+			if (!a_movie) {
+				return "<null>";
+			}
+
+			auto* def = a_movie->GetMovieDef();
+			if (!def) {
+				return "<no def>";
+			}
+
+			const char* url = def->GetFileURL();
+			if (!url || !*url) {
+				return "<no url>";
+			}
+
+			// Only the leaf name; the full path is a long Data\Interface\... prefix that is
+			// the same for every movie and would swamp the line.
+			const std::string full = url;
+			const auto        slash = full.find_last_of("\\/");
+			return slash == std::string::npos ? full : full.substr(slash + 1);
 		}
 
 		// Every on-stack menu OTHER than the vanilla Cursor Menu that owns a Scaleform movie
@@ -665,8 +751,9 @@ namespace CursorUnbound
 					out += ", ";
 				}
 				out += std::format(
-					"{}(movie=0x{:X} visible={}{})",
+					"{}[{}](movie=0x{:X} visible={}{})",
 					name ? name : "<unnamed>",
+					MovieSourceFile(movie),
 					reinterpret_cast<std::uintptr_t>(movie),
 					movie->GetVisible(),
 					movie == suppressed ? " SUPPRESSED" : "");
@@ -684,9 +771,15 @@ namespace CursorUnbound
 				return;
 			}
 
+			// One second while a menu is up, three while idle. A Prisma menu can come and go
+			// inside a single three second window, which left exactly one sample of the state
+			// worth watching.
+			const std::uint64_t interval =
+				g_active.load(std::memory_order_relaxed) ? 1000 : 3000;
+
 			static std::uint64_t lastTick = 0;
 			const auto           now = ::GetTickCount64();
-			if (now - lastTick < 3000) {
+			if (now - lastTick < interval) {
 				return;
 			}
 			lastTick = now;
@@ -739,29 +832,50 @@ namespace CursorUnbound
 			// else the rest of the log says.
 			SKSE::log::info(
 				"[input] since activation: ProcessMouseMove entered={} engaged={} thumbstick={} "
-				"| WM_MOUSEMOVE={} WM_SETCURSOR={} answered={} | wndProcIsOurs={} cursorIsOurs={}",
+				"| WM_TIMER={} WM_MOUSEMOVE={} WM_SETCURSOR={} answered={} | cursorIsOurs={}",
 				g_stats.mouseMoveCalls,
 				g_stats.mouseMoveEngaged,
 				g_stats.thumbstickCalls,
+				g_stats.wmTimer,
 				g_stats.wmMouseMove,
 				g_stats.wmSetCursor,
 				g_stats.wmSetCursorAnswered,
-				WndProcIsOurs(),
 				CursorIsOurs());
+
+			// Which window we are attached to, which one the input is actually going to, and
+			// who owns the head of the procedure chain. `ourWindow` differing from `underCursor`
+			// means we subclassed the wrong window; them agreeing while `chainOwner` is another
+			// module means that module is not chaining to us.
+			POINT probe{};
+			HWND  underCursor = ::GetCursorPos(&probe) ? ::WindowFromPoint(probe) : nullptr;
+			const auto chainHead = CurrentWndProc();
+			SKSE::log::info(
+				"[window] ourWindow=0x{:X} foreground=0x{:X} underCursor=0x{:X} | "
+				"chainHead=0x{:X} owner={} isOurs={}",
+				reinterpret_cast<std::uintptr_t>(g_window),
+				reinterpret_cast<std::uintptr_t>(::GetForegroundWindow()),
+				reinterpret_cast<std::uintptr_t>(underCursor),
+				static_cast<std::uintptr_t>(chainHead),
+				ModuleNameForAddress(chainHead),
+				WndProcIsOurs());
 
 			// Movie identity. `match=false` means our suppression is pointed at a movie the
 			// game has since replaced, so the live cursor movie is drawing unsuppressed.
 			std::uintptr_t vanillaMovie = 0;
+			std::string    vanillaSource = "<none>";
 			if (auto* ui = RE::UI::GetSingleton()) {
 				if (auto menu = ui->GetMenu(RE::CursorMenu::MENU_NAME); menu && menu->uiMovie) {
 					vanillaMovie = reinterpret_cast<std::uintptr_t>(menu->uiMovie.get());
+					vanillaSource = MovieSourceFile(menu->uiMovie.get());
 				}
 			}
 			const auto suppressedMovie =
 				reinterpret_cast<std::uintptr_t>(g_suppressedMovie.load(std::memory_order_acquire));
 			SKSE::log::info(
-				"[movies] vanillaCursorMovie=0x{:X} suppressed=0x{:X} match={} | other cursor movies: {}",
+				"[movies] vanillaCursorMovie=0x{:X}[{}] suppressed=0x{:X} match={} | "
+				"other cursor-flagged menus: {}",
 				vanillaMovie,
+				vanillaSource,
 				suppressedMovie,
 				vanillaMovie != 0 && vanillaMovie == suppressedMovie,
 				DescribeForeignCursorMovies());
@@ -1146,6 +1260,7 @@ namespace CursorUnbound
 				// a menu that opens while the mouse is still - the main menu at startup, most
 				// obviously - has nothing to bring the pointer up.
 				if (a_wparam == kSyncTimerId) {
+					++g_stats.wmTimer;
 					SyncActiveState();
 					if (!g_window || ::GetForegroundWindow() == g_window) {
 						AssertCursorState();
@@ -1250,6 +1365,11 @@ namespace CursorUnbound
 
 			g_originalWndProc = reinterpret_cast<WNDPROC>(previous);
 			g_ourWndProc = &WndProc;
+
+			SKSE::log::info(
+				"Window procedure chain at hook time: previous owner={} (0x{:X}), we are now the head.",
+				ModuleNameForAddress(reinterpret_cast<LONG_PTR>(g_originalWndProc)),
+				reinterpret_cast<std::uintptr_t>(g_originalWndProc));
 
 			// ~60 Hz. WM_TIMER is the lowest-priority message there is, so this never competes
 			// with input or painting - it only guarantees us a look in every frame or so even
@@ -1390,16 +1510,18 @@ namespace CursorUnbound
 
 			SKSE::log::info(
 				"Deactivated (showCursorCount={}) | this session: ProcessMouseMove entered={} "
-				"engaged={} thumbstick={} | WM_MOUSEMOVE={} WM_SETCURSOR={} answered={} | "
-				"wndProcIsOurs={} cursorIsOurs={}",
+				"engaged={} thumbstick={} | WM_TIMER={} WM_MOUSEMOVE={} WM_SETCURSOR={} "
+				"answered={} | wndProcIsOurs={} chainOwner={} cursorIsOurs={}",
 				g_lastCursorCount,
 				g_stats.mouseMoveCalls,
 				g_stats.mouseMoveEngaged,
 				g_stats.thumbstickCalls,
+				g_stats.wmTimer,
 				g_stats.wmMouseMove,
 				g_stats.wmSetCursor,
 				g_stats.wmSetCursorAnswered,
 				WndProcIsOurs(),
+				ModuleNameForAddress(CurrentWndProc()),
 				CursorIsOurs());
 		}
 
