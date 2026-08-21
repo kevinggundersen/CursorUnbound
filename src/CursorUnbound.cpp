@@ -17,6 +17,7 @@ namespace CursorUnbound
 		HWND     g_window = nullptr;
 		bool     g_windowIsUnicode = true;
 		WNDPROC  g_originalWndProc = nullptr;
+		WNDPROC  g_ourWndProc = nullptr;
 		HCURSOR  g_customCursor = nullptr;
 		HCURSOR  g_fallbackCursor = nullptr;
 
@@ -36,8 +37,41 @@ namespace CursorUnbound
 			std::uint64_t entryVisible = 0;  // movie was visible again when we re-entered
 			std::uint64_t entryHidden = 0;   // our previous hide was still in effect
 			std::uintptr_t lastMovie = 0;
+
+			// Input path, reset on every activation so each counter reads "since this menu
+			// opened". The question they answer is whether CursorMenu::ProcessMouseMove is
+			// reached at all: an ImGui overlay or an HTML framework that owns mouse input
+			// leaves `mouseMoveCalls` at zero, and every downstream symptom - no absolute
+			// positioning, no re-suppression - follows from that single fact.
+			std::uint64_t mouseMoveCalls = 0;    // hook entered
+			std::uint64_t mouseMoveEngaged = 0;  // hook actually wrote an absolute position
+			std::uint64_t thumbstickCalls = 0;
+
+			// Window path, also reset on activation. Zero WM_SETCURSOR while we are active
+			// means something subclassed the window after us and is answering it first, which
+			// is what a pointer that is plainly not our art looks like from in here.
+			std::uint64_t wmMouseMove = 0;
+			std::uint64_t wmSetCursor = 0;
+			std::uint64_t wmSetCursorAnswered = 0;
+
+			void ResetPerActivation()
+			{
+				mouseMoveCalls = 0;
+				mouseMoveEngaged = 0;
+				thumbstickCalls = 0;
+				wmMouseMove = 0;
+				wmSetCursor = 0;
+				wmSetCursorAnswered = 0;
+			}
 		};
 		Diagnostics g_stats;
+
+		// Diagnostic line budget, spent per activation rather than once per session. It used
+		// to be a function-local counter that ran down while the game sat at the main menu, so
+		// a two minute load screen consumed the whole allowance before the player opened
+		// anything - and the menu list, the one field worth having, was missing from exactly
+		// the window that mattered.
+		int g_diagEmitted = 0;
 
 		// Calibration bookkeeping for [Debug] LogCursorRange.
 		float         g_observedMinX = (std::numeric_limits<float>::max)();
@@ -569,6 +603,78 @@ namespace CursorUnbound
 				rootAlphaResult);
 		}
 
+		// True while our subclass is still the head of the window's procedure chain. Another
+		// module subclassing after us puts its procedure in front of ours, and it can then
+		// answer WM_SETCURSOR - or swallow mouse messages - before we ever see them. That is
+		// what "the menu shows a plain OS arrow instead of the configured art" looks like
+		// from inside this plugin.
+		bool WndProcIsOurs()
+		{
+			HWND hwnd = ResolveGameWindow();
+			if (!hwnd || !g_ourWndProc) {
+				return false;
+			}
+
+			const auto current = g_windowIsUnicode
+				? ::GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
+				: ::GetWindowLongPtrA(hwnd, GWLP_WNDPROC);
+			return current == reinterpret_cast<LONG_PTR>(g_ourWndProc);
+		}
+
+		// True while the shape Windows is actually drawing is the one we asked for. False with
+		// WndProcIsOurs also false is the signature of another framework owning the pointer.
+		bool CursorIsOurs()
+		{
+			HCURSOR ours = g_customCursor ? g_customCursor : g_fallbackCursor;
+			return ours != nullptr && ::GetCursor() == ours;
+		}
+
+		// Every on-stack menu OTHER than the vanilla Cursor Menu that owns a Scaleform movie
+		// and claims the cursor.
+		//
+		// This is the scan that finds a second cursor movie. A UI framework can load its own
+		// instance of cursormenu.swf under its own menu name and set kUsesCursor on it -
+		// PrismaUI's focus menu does exactly that - and suppressing the vanilla Cursor Menu
+		// then leaves that copy still drawing, on top of our hardware cursor.
+		std::string DescribeForeignCursorMovies()
+		{
+			auto* ui = RE::UI::GetSingleton();
+			if (!ui) {
+				return "<no ui>";
+			}
+
+			const auto* suppressed = g_suppressedMovie.load(std::memory_order_acquire);
+
+			std::string out;
+			for (const auto& entry : ui->menuMap) {
+				const auto& menu = entry.second.menu;
+				if (!menu || !menu->OnStack() || !menu->uiMovie) {
+					continue;
+				}
+
+				const char* name = entry.first.c_str();
+				if (name && RE::CursorMenu::MENU_NAME == name) {
+					continue;
+				}
+				if (!menu->menuFlags.all(RE::UI_MENU_FLAGS::kUsesCursor)) {
+					continue;
+				}
+
+				auto* movie = menu->uiMovie.get();
+				if (!out.empty()) {
+					out += ", ";
+				}
+				out += std::format(
+					"{}(movie=0x{:X} visible={}{})",
+					name ? name : "<unnamed>",
+					reinterpret_cast<std::uintptr_t>(movie),
+					movie->GetVisible(),
+					movie == suppressed ? " SUPPRESSED" : "");
+			}
+
+			return out.empty() ? "<none>" : out;
+		}
+
 		// Dumps a compact summary instead of a line per call. The counters answer the only
 		// question that matters: does our hide stay applied between calls, and if the cursor
 		// is still on screen, which other menus are up that might be drawing it?
@@ -585,13 +691,13 @@ namespace CursorUnbound
 			}
 			lastTick = now;
 
-			// Bounded so a long session does not accumulate thousands of lines. A couple of
-			// minutes of activity is more than enough to diagnose anything.
-			static int emitted = 0;
-			if (emitted >= 40) {
+			// Bounded so a long session does not accumulate thousands of lines. The budget is
+			// refilled by Activate(), so it is spent on the menu the player just opened rather
+			// than on whatever the game was doing beforehand.
+			if (g_diagEmitted >= 40) {
 				return;
 			}
-			++emitted;
+			++g_diagEmitted;
 
 			// Every live menu object, tagged with the two things the activation decision reads:
 			// '*' for on the stack (i.e. genuinely open), '+' for carrying kUsesCursor. An
@@ -627,6 +733,59 @@ namespace CursorUnbound
 				g_stats.lastMovie,
 				g_lastCursorCount,
 				menus.empty() ? "<none>" : menus);
+
+			// Who is actually receiving the input, and who owns the pointer. `entered=0` while
+			// a menu is up means our absolute positioning never runs for that menu, whatever
+			// else the rest of the log says.
+			SKSE::log::info(
+				"[input] since activation: ProcessMouseMove entered={} engaged={} thumbstick={} "
+				"| WM_MOUSEMOVE={} WM_SETCURSOR={} answered={} | wndProcIsOurs={} cursorIsOurs={}",
+				g_stats.mouseMoveCalls,
+				g_stats.mouseMoveEngaged,
+				g_stats.thumbstickCalls,
+				g_stats.wmMouseMove,
+				g_stats.wmSetCursor,
+				g_stats.wmSetCursorAnswered,
+				WndProcIsOurs(),
+				CursorIsOurs());
+
+			// Movie identity. `match=false` means our suppression is pointed at a movie the
+			// game has since replaced, so the live cursor movie is drawing unsuppressed.
+			std::uintptr_t vanillaMovie = 0;
+			if (auto* ui = RE::UI::GetSingleton()) {
+				if (auto menu = ui->GetMenu(RE::CursorMenu::MENU_NAME); menu && menu->uiMovie) {
+					vanillaMovie = reinterpret_cast<std::uintptr_t>(menu->uiMovie.get());
+				}
+			}
+			const auto suppressedMovie =
+				reinterpret_cast<std::uintptr_t>(g_suppressedMovie.load(std::memory_order_acquire));
+			SKSE::log::info(
+				"[movies] vanillaCursorMovie=0x{:X} suppressed=0x{:X} match={} | other cursor movies: {}",
+				vanillaMovie,
+				suppressedMovie,
+				vanillaMovie != 0 && vanillaMovie == suppressedMovie,
+				DescribeForeignCursorMovies());
+
+			// The direct measurement of the sensitivity complaint: if gameCursor does not track
+			// osClient scaled by span, the game's pointer is still integrating its own
+			// fps-scaled delta and our absolute write is not landing.
+			POINT osPoint{};
+			const bool osOk = ::GetCursorPos(&osPoint) != FALSE;
+			POINT      clientPoint = osPoint;
+			if (osOk && g_window) {
+				::ScreenToClient(g_window, &clientPoint);
+			}
+			auto* menuCursor = RE::MenuCursor::GetSingleton();
+			SKSE::log::info(
+				"[track] osScreen=({}, {}) osClient=({}, {}) gameCursor=({:.1f}, {:.1f}) "
+				"screenWidth=({:.1f}, {:.1f}) sensitivity={:.3f}",
+				osPoint.x, osPoint.y,
+				clientPoint.x, clientPoint.y,
+				menuCursor ? menuCursor->cursorPosX : -1.0f,
+				menuCursor ? menuCursor->cursorPosY : -1.0f,
+				menuCursor ? menuCursor->screenWidthX : -1.0f,
+				menuCursor ? menuCursor->screenWidthY : -1.0f,
+				menuCursor ? menuCursor->cursorSensitivity : -1.0f);
 		}
 
 		// The game re-shows its cursor on some menu transitions, so re-assert periodically
@@ -997,6 +1156,7 @@ namespace CursorUnbound
 				break;
 
 			case WM_MOUSEMOVE:
+				++g_stats.wmMouseMove;
 				// Re-assert the image here too. WM_SETCURSOR is not guaranteed to arrive on
 				// every move if something else in the process answers it first.
 				SyncActiveState();
@@ -1005,6 +1165,7 @@ namespace CursorUnbound
 				break;
 
 			case WM_SETCURSOR:
+				++g_stats.wmSetCursor;
 				// The game does not handle WM_SETCURSOR itself, so this is where we get to name
 				// the cursor image. Answering it rather than falling through to DefWindowProc
 				// is what stops the window class cursor being applied over ours a moment later.
@@ -1018,6 +1179,7 @@ namespace CursorUnbound
 					}
 					::SetCursor(cursor);
 					ForceCursorShown();
+					++g_stats.wmSetCursorAnswered;
 					return TRUE;
 				}
 				break;
@@ -1087,6 +1249,7 @@ namespace CursorUnbound
 			}
 
 			g_originalWndProc = reinterpret_cast<WNDPROC>(previous);
+			g_ourWndProc = &WndProc;
 
 			// ~60 Hz. WM_TIMER is the lowest-priority message there is, so this never competes
 			// with input or painting - it only guarantees us a look in every frame or so even
@@ -1193,6 +1356,12 @@ namespace CursorUnbound
 			ApplyClip(config.clipToWindow);
 
 			++g_stats.activations;
+
+			// Refill the diagnostic budget and zero the per-activation counters, so the log
+			// describes the menu that just opened rather than everything before it.
+			g_diagEmitted = 0;
+			g_stats.ResetPerActivation();
+
 			SKSE::log::info(
 				"Activated (hardwareCursor={}, customArt={}, showCursorCount={}).",
 				config.useHardwareCursor,
@@ -1219,7 +1388,19 @@ namespace CursorUnbound
 				ClearSuppressedMovie();
 			}
 
-			SKSE::log::info("Deactivated (showCursorCount={}).", g_lastCursorCount);
+			SKSE::log::info(
+				"Deactivated (showCursorCount={}) | this session: ProcessMouseMove entered={} "
+				"engaged={} thumbstick={} | WM_MOUSEMOVE={} WM_SETCURSOR={} answered={} | "
+				"wndProcIsOurs={} cursorIsOurs={}",
+				g_lastCursorCount,
+				g_stats.mouseMoveCalls,
+				g_stats.mouseMoveEngaged,
+				g_stats.thumbstickCalls,
+				g_stats.wmMouseMove,
+				g_stats.wmSetCursor,
+				g_stats.wmSetCursorAnswered,
+				WndProcIsOurs(),
+				CursorIsOurs());
 		}
 
 		// ---------------------------------------------------------------------------
@@ -1261,6 +1442,8 @@ namespace CursorUnbound
 		{
 			static bool thunk(RE::MenuEventHandler* a_this, RE::ThumbstickEvent* a_event)
 			{
+				++g_stats.thumbstickCalls;
+
 				// A small deadzone, so stick drift on a worn controller does not keep
 				// yanking the cursor away from a mouse user.
 				if (a_event && g_runtimeReady.load(std::memory_order_relaxed) &&
@@ -1281,6 +1464,8 @@ namespace CursorUnbound
 		{
 			static bool thunk(RE::MenuEventHandler* a_this, RE::MouseMoveEvent* a_event)
 			{
+				++g_stats.mouseMoveCalls;
+
 				const auto& config = Config::Get();
 
 				// Any real mouse movement means the player is back on the mouse.
@@ -1316,6 +1501,7 @@ namespace CursorUnbound
 				// hit-test following the game's fps-scaled integration while MenuCursor holds
 				// ours - the two disagree every frame, which reads as jitter.
 				WriteCursorPosition(x, y);
+				++g_stats.mouseMoveEngaged;
 
 				const auto savedX = a_event->mouseInputX;
 				const auto savedY = a_event->mouseInputY;
