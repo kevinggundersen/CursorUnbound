@@ -227,61 +227,188 @@ namespace CursorUnbound
 			return RealShowCursor(a_show);
 		}
 
+		// A bounds-checked view over a module that is currently mapped into the process.
+		//
+		// Everything below reads PE structures belonging to somebody else's module, and every
+		// offset in them is data we do not control: modules get packed, import directories get
+		// rewritten by other hooking libraries, and a hand-written proxy DLL only has to be
+		// valid enough for the loader, not shaped the way the documentation draws it. 1.0.2
+		// walked those structures unchecked and dereferenced whatever came out, which is what
+		// crashed at kDataLoaded on load orders containing such a module. Nothing here is
+		// allowed to read outside the image.
+		struct ModuleImage
+		{
+			std::uint8_t* base = nullptr;
+			std::uint32_t size = 0;
+
+			bool Contains(std::uint64_t a_rva, std::uint64_t a_bytes) const
+			{
+				return a_rva + a_bytes >= a_rva && a_rva + a_bytes <= size;
+			}
+
+			template <class T>
+			const T* At(std::uint64_t a_rva, std::uint64_t a_count = 1) const
+			{
+				return Contains(a_rva, sizeof(T) * a_count) ? reinterpret_cast<const T*>(base + a_rva) : nullptr;
+			}
+
+			// A string only counts as readable if its terminator is inside the image too -
+			// otherwise the compare that follows runs off the end looking for one.
+			const char* String(std::uint64_t a_rva) const
+			{
+				if (a_rva >= size) {
+					return nullptr;
+				}
+				const auto* first = reinterpret_cast<const char*>(base + a_rva);
+				const auto  span = static_cast<std::size_t>(size - a_rva);
+				return std::memchr(first, '\0', span) ? first : nullptr;
+			}
+		};
+
+		// Validates a loaded module's PE headers and returns a view of it. The first page of a
+		// mapped image is always present, so reading the headers themselves is safe; every
+		// offset taken out of them is treated as hostile from here on.
+		bool OpenModuleImage(HMODULE a_module, ModuleImage& a_out)
+		{
+			auto* const base = reinterpret_cast<std::uint8_t*>(a_module);
+			if (!base) {
+				return false;
+			}
+
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+			if (dos->e_magic != IMAGE_DOS_SIGNATURE ||
+				dos->e_lfanew < 0 ||
+				static_cast<std::size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > 0x1000) {
+				return false;
+			}
+
+			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+			if (nt->Signature != IMAGE_NT_SIGNATURE ||
+				nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+				nt->OptionalHeader.SizeOfImage < 0x1000) {
+				return false;
+			}
+
+			a_out.base = base;
+			a_out.size = nt->OptionalHeader.SizeOfImage;
+			return true;
+		}
+
+		const IMAGE_NT_HEADERS64* ModuleHeaders(const ModuleImage& a_image)
+		{
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(a_image.base);
+			return reinterpret_cast<const IMAGE_NT_HEADERS64*>(a_image.base + dos->e_lfanew);
+		}
+
+		// DataDirectory is not the fixed 16-entry array it is declared as: only the first
+		// NumberOfRvaAndSizes entries exist. Indexing past that reads the section headers that
+		// follow the optional header and interprets them as an RVA and a size - which is one
+		// way to end up walking "imports" that are really somebody's section table.
+		const IMAGE_DATA_DIRECTORY* ModuleDirectory(const ModuleImage& a_image, std::uint32_t a_index)
+		{
+			const auto* nt = ModuleHeaders(a_image);
+			if (nt->OptionalHeader.NumberOfRvaAndSizes <= a_index) {
+				return nullptr;
+			}
+
+			const auto& dir = nt->OptionalHeader.DataDirectory[a_index];
+			if (!dir.VirtualAddress || !dir.Size || !a_image.Contains(dir.VirtualAddress, dir.Size)) {
+				return nullptr;
+			}
+			return &dir;
+		}
+
 		// Locates the import table slot a module uses to call a_dll!a_function.
 		//
 		// SKSE::GetIATPtr exists, but it only ever walks the game executable and logs a
 		// warning for every miss - across a few hundred loaded modules that is a few hundred
 		// warnings per launch. This also handles a null OriginalFirstThunk, which bound
 		// imports leave behind and which SKSE's version dereferences unconditionally.
-		void** FindImportSlot(HMODULE a_module, const char* a_dll, const char* a_function)
+		void** FindImportSlotIn(const ModuleImage& a_image, const char* a_dll, const char* a_function)
 		{
-			auto* const base = reinterpret_cast<std::uint8_t*>(a_module);
-			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-			if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+			const auto* dir = ModuleDirectory(a_image, IMAGE_DIRECTORY_ENTRY_IMPORT);
+			if (!dir) {
 				return nullptr;
 			}
 
-			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-			if (nt->Signature != IMAGE_NT_SIGNATURE) {
+			// The descriptor array ends with an all-zero entry, but the directory size is the
+			// authority on how far it may extend. Trusting only the terminator is what lets a
+			// module without one walk into whatever data follows, where the next "Name" is
+			// really the low half of a pointer and base+Name lands outside the address space.
+			const std::uint64_t remaining =
+				(a_image.size - dir->VirtualAddress) / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+
+			std::uint64_t count = dir->Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+			if (count == 0 || count > remaining) {
+				// A directory size too small to hold a descriptor, or too large to fit the
+				// image, is not a reason to give up on the module - the terminator can still
+				// end the walk. It is a reason to let the image bound be the one that binds.
+				count = remaining;
+			}
+
+			const auto* desc = a_image.At<IMAGE_IMPORT_DESCRIPTOR>(dir->VirtualAddress, count);
+			if (!desc) {
 				return nullptr;
 			}
 
-			const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-			if (!dir.VirtualAddress || !dir.Size) {
-				return nullptr;
-			}
-
-			for (auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
-				 desc->Name != 0;
-				 ++desc) {
-				const auto* name = reinterpret_cast<const char*>(base + desc->Name);
-				if (_stricmp(name, a_dll) != 0) {
+			for (std::uint64_t d = 0; d < count && desc[d].Name != 0; ++d) {
+				const char* dll = a_image.String(desc[d].Name);
+				if (!dll || _stricmp(dll, a_dll) != 0) {
 					continue;
 				}
 
 				// Bound imports zero OriginalFirstThunk, leaving FirstThunk as the only copy
 				// of the name table. It is still readable, it just doubles as the live slot.
-				const auto namesRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
-				if (!namesRva || !desc->FirstThunk) {
+				const std::uint64_t namesRva =
+					desc[d].OriginalFirstThunk ? desc[d].OriginalFirstThunk : desc[d].FirstThunk;
+				if (!namesRva || !desc[d].FirstThunk || namesRva >= a_image.size) {
 					continue;
 				}
 
-				const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + namesRva);
-				auto*       slots = reinterpret_cast<void**>(base + desc->FirstThunk);
+				// Same reasoning as above: the thunk array is null-terminated, but the image
+				// bound decides how long it is allowed to be.
+				const std::uint64_t maxEntries = (a_image.size - namesRva) / sizeof(IMAGE_THUNK_DATA64);
+				for (std::uint64_t i = 0; i < maxEntries; ++i) {
+					const auto* thunk = a_image.At<IMAGE_THUNK_DATA64>(namesRva + (i * sizeof(IMAGE_THUNK_DATA64)));
+					if (!thunk || thunk->u1.AddressOfData == 0) {
+						break;
+					}
+					if (IMAGE_SNAP_BY_ORDINAL64(thunk->u1.Ordinal)) {
+						continue;  // Imported by ordinal, so it carries no name to match.
+					}
 
-				for (std::size_t i = 0; names[i].u1.AddressOfData != 0; ++i) {
-					if (IMAGE_SNAP_BY_ORDINAL64(names[i].u1.Ordinal)) {
+					const char* name =
+						a_image.String(thunk->u1.AddressOfData + offsetof(IMAGE_IMPORT_BY_NAME, Name));
+					if (!name || std::strcmp(name, a_function) != 0) {
 						continue;
 					}
-					const auto* import =
-						reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names[i].u1.AddressOfData);
-					if (std::strcmp(import->Name, a_function) == 0) {
-						return slots + i;
-					}
+
+					const auto* slot = a_image.At<void*>(desc[d].FirstThunk + (i * sizeof(void*)));
+					return const_cast<void**>(slot);
 				}
 			}
 
 			return nullptr;
+		}
+
+		// Even a fully validated walk can fault, because the validation and the read are not
+		// one atomic act: a module can be unloaded, or have its import directory point into
+		// memory another mod owns and is busy rewriting. A module we cannot read is a module
+		// we skip - none of this is worth taking the game down for.
+		//
+		// The SEH frame lives here, in a function with no unwindable locals, so the C++ work
+		// stays in FindImportSlotIn where destructors are allowed.
+		void** FindImportSlot(HMODULE a_module, const char* a_dll, const char* a_function)
+		{
+			__try {
+				ModuleImage image{};
+				if (!OpenModuleImage(a_module, image)) {
+					return nullptr;
+				}
+				return FindImportSlotIn(image, a_dll, a_function);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return nullptr;
+			}
 		}
 
 		// Redirects one module's USER32!ShowCursor import to our hook. Returns true if the
@@ -361,6 +488,7 @@ namespace CursorUnbound
 				&self);
 
 			const HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
+			const HMODULE gameExe = ::GetModuleHandleW(nullptr);
 
 			int         patched = 0;
 			std::string names;
@@ -371,11 +499,40 @@ namespace CursorUnbound
 				do {
 					// Skipping ourselves keeps RealShowCursor's ::ShowCursor fallback from
 					// re-entering the hook if the slot capture above ever came up empty.
-					if (entry.hModule == self || entry.hModule == user32 ||
+					if (!entry.hModule || entry.hModule == self || entry.hModule == user32 ||
 						IsSystemModule(entry.szExePath)) {
 						continue;
 					}
-					if (PatchShowCursorIn(entry.hModule)) {
+
+					// Named before it is walked, not after, so that if a module ever does
+					// take the process down here the log says which one it was.
+					SKSE::log::debug("Sweeping {} for USER32!ShowCursor.", Narrow(entry.szModule));
+
+					// The snapshot lists modules that were loaded a moment ago. Take a real
+					// reference before reading one, so it cannot be unmapped mid-walk. The
+					// executable is exempt: the loader pins it, and it is never going away.
+					HMODULE target = entry.hModule;
+					bool    referenced = false;
+					if (target != gameExe) {
+						HMODULE pinned = nullptr;
+						if (!::GetModuleHandleExW(
+								GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+								reinterpret_cast<LPCWSTR>(entry.modBaseAddr),
+								&pinned) ||
+							!pinned) {
+							continue;  // Unloaded since the snapshot was taken.
+						}
+						target = pinned;
+						referenced = true;
+					}
+
+					const bool imported = PatchShowCursorIn(target);
+
+					if (referenced) {
+						::FreeLibrary(target);
+					}
+
+					if (imported) {
 						++patched;
 						if (!names.empty()) {
 							names += ", ";
@@ -442,24 +599,27 @@ namespace CursorUnbound
 
 		bool GetTextSection(HMODULE a_module, std::uint8_t*& a_outBegin, std::size_t& a_outSize)
 		{
-			auto* const base = reinterpret_cast<std::uint8_t*>(a_module);
-			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-			if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+			ModuleImage image{};
+			if (!OpenModuleImage(a_module, image)) {
 				return false;
 			}
 
-			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-			if (nt->Signature != IMAGE_NT_SIGNATURE) {
-				return false;
-			}
-
+			const auto* nt = ModuleHeaders(image);
 			const auto* section = IMAGE_FIRST_SECTION(nt);
 			for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
-				if (std::memcmp(section->Name, ".text", 5) == 0) {
-					a_outBegin = base + section->VirtualAddress;
-					a_outSize = section->Misc.VirtualSize;
-					return true;
+				if (std::memcmp(section->Name, ".text", 5) != 0) {
+					continue;
 				}
+
+				// The scan that follows reads every byte of this range, so a section header
+				// claiming more than the image holds has to fail here rather than there.
+				if (!image.Contains(section->VirtualAddress, section->Misc.VirtualSize)) {
+					return false;
+				}
+
+				a_outBegin = image.base + section->VirtualAddress;
+				a_outSize = section->Misc.VirtualSize;
+				return true;
 			}
 			return false;
 		}
@@ -538,19 +698,13 @@ namespace CursorUnbound
 		// for a DLL like PrismaUI that ships no version resource.
 		std::string DescribeModuleBuild(HMODULE a_module)
 		{
-			auto* const base = reinterpret_cast<std::uint8_t*>(a_module);
-			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-			if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) {
-				return "<not a module>";
+			ModuleImage image{};
+			if (!OpenModuleImage(a_module, image)) {
+				return "<unreadable PE header>";
 			}
 
-			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-			if (nt->Signature != IMAGE_NT_SIGNATURE) {
-				return "<bad PE header>";
-			}
-
-			const auto stamp = nt->FileHeader.TimeDateStamp;
-			const auto image = nt->OptionalHeader.SizeOfImage;
+			const auto* nt = ModuleHeaders(image);
+			const auto  stamp = nt->FileHeader.TimeDateStamp;
 
 			char when[32] = "?";
 			auto asTime = static_cast<std::time_t>(stamp);
@@ -562,7 +716,7 @@ namespace CursorUnbound
 			const auto version = ModuleFileVersion(a_module);
 			return std::format("{}build 0x{:08X} ({}), image 0x{:X}",
 				version.empty() ? "" : std::format("v{}, ", version),
-				stamp, when, image);
+				stamp, when, image.size);
 		}
 
 		void ResolvePrismaDrawCursor()

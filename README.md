@@ -149,6 +149,16 @@ plugin could not start its message-queue timer and is back to needing mouse inpu
 notices a menu. `Activated (... showCursorCount=N)` should report `N >= 0`; a negative N
 means something is still driving the OS display counter down behind the plugin.
 
+**Crash on reaching the main menu, with `CursorUnbound.dll` in the crash log.** This was a
+bug in 1.0.2 and 1.0.3, fixed in 1.0.4. Those versions walked the import table of every
+loaded module to find `USER32!ShowCursor`, and trusted the structures they found there; a
+module whose import directory is not shaped the way the PE documentation draws it — packed,
+proxied, or rewritten by another hooking library — sent the walk off the end of the image.
+The log stops after `Patched USER32!ShowCursor in the game import table.` and never reaches
+`Patched USER32!ShowCursor in N module(s)`. On 1.0.2 or 1.0.3, `HookAllModules = false`
+avoids it. On 1.0.4 the walk is bounds-checked and skips any module it cannot read;
+`LogLevel = debug` then names each module as it is swept, which identifies the offender.
+
 **Conflicts.** Mods that draw their own pointer (ImGui-based overlays) or manage cursor
 visibility can fight this. Skyrim Souls RE changes which menus are open and is worth
 testing early.
