@@ -1289,12 +1289,20 @@ namespace CursorUnbound
 
 			const auto clientW = static_cast<float>(client.right - client.left);
 			const auto clientH = static_cast<float>(client.bottom - client.top);
-			if (clientW <= 0.0f || clientH <= 0.0f) {
+			if (clientW <= 1.0f || clientH <= 1.0f) {
 				return false;
 			}
 
-			const float normalizedX = std::clamp(static_cast<float>(point.x) / clientW, 0.0f, 1.0f);
-			const float normalizedY = std::clamp(static_cast<float>(point.y) / clientH, 0.0f, 1.0f);
+			// Divide by the last addressable pixel, not the pixel count. ScreenToClient tops
+			// out at clientH - 1, so dividing by clientH makes the bottom row land just short
+			// of spanY and the far edge unreachable - 1599 of 1600, never 1600. The game's own
+			// integration saturates against its clamp and sits at exactly the maximum, so
+			// anything testing for the cursor being *at* the edge sees true from vanilla and
+			// false from us. That is why the world map would pan up but never down: an error
+			// of this shape is zero at the origin and maximal at the opposite edge, so top and
+			// left were always fine while bottom and right silently lost the last unit.
+			const float normalizedX = std::clamp(static_cast<float>(point.x) / (clientW - 1.0f), 0.0f, 1.0f);
+			const float normalizedY = std::clamp(static_cast<float>(point.y) / (clientH - 1.0f), 0.0f, 1.0f);
 
 			float spanX = 0.0f;
 			float spanY = 0.0f;
@@ -1334,7 +1342,7 @@ namespace CursorUnbound
 
 			const auto clientW = static_cast<float>(client.right - client.left);
 			const auto clientH = static_cast<float>(client.bottom - client.top);
-			if (clientW <= 0.0f || clientH <= 0.0f) {
+			if (clientW <= 1.0f || clientH <= 1.0f) {
 				return;
 			}
 
@@ -1348,9 +1356,12 @@ namespace CursorUnbound
 			const float normalizedX = std::clamp(menuCursor->cursorPosX / spanX, 0.0f, 1.0f);
 			const float normalizedY = std::clamp(menuCursor->cursorPosY / spanY, 0.0f, 1.0f);
 
+			// The inverse of ComputeAbsolutePosition, and it has to scale by the same extent:
+			// against clientW a cursor sitting at spanX would target clientW, one past the last
+			// valid pixel, and get pushed back a pixel by the clip rect on arrival.
 			POINT target{
-				static_cast<LONG>(std::lround(normalizedX * clientW)),
-				static_cast<LONG>(std::lround(normalizedY * clientH))
+				static_cast<LONG>(std::lround(normalizedX * (clientW - 1.0f))),
+				static_cast<LONG>(std::lround(normalizedY * (clientH - 1.0f)))
 			};
 			if (::ClientToScreen(hwnd, &target)) {
 				::SetCursorPos(target.x, target.y);
@@ -1860,16 +1871,39 @@ namespace CursorUnbound
 					ExitGamepadMode();
 				}
 
-				const bool engaged =
+				// Whether a menu currently has the pointer. This is what decides both halves
+				// below - AbsolutePositioning gates only the position write, because the game's
+				// own cursor has to be kept hidden either way.
+				const bool active =
 					g_runtimeReady.load(std::memory_order_relaxed) &&
 					g_active.load(std::memory_order_relaxed) &&
 					!g_gamepadMode.load(std::memory_order_relaxed) &&
-					config.enabled &&
-					config.absolutePositioning;
+					config.enabled;
 
-				if (!engaged) {
-					return func(a_this, a_event);
+				bool handled = false;
+				if (active && config.absolutePositioning) {
+					handled = DriveAbsolutePosition(a_this, a_event);
+				} else {
+					handled = func(a_this, a_event);
 				}
+
+				// Deliberately outside the positioning branch. Some menus re-show the game
+				// cursor every frame, and the one-shot hides on menu open lose that race, so
+				// this per-move re-assert is the only thing holding it down. Hanging it off
+				// AbsolutePositioning meant the documented AbsolutePositioning = false fallback
+				// silently gave up the suppression too, and drew both cursors.
+				if (active) {
+					ReassertScaleformHidden();
+				}
+
+				return handled;
+			}
+
+			// The absolute-positioning half, split out so the caller has a single exit and
+			// the cursor re-assert above cannot be skipped by one of its early returns.
+			static bool DriveAbsolutePosition(RE::MenuEventHandler* a_this, RE::MouseMoveEvent* a_event)
+			{
+				const auto& config = Config::Get();
 
 				if (auto* menuCursor = RE::MenuCursor::GetSingleton()) {
 					MaybeLogRange(*menuCursor);
@@ -1909,8 +1943,6 @@ namespace CursorUnbound
 
 				// Re-assert in case the original clamped or rewrote the position.
 				WriteCursorPosition(x, y);
-
-				ReassertScaleformHidden();
 
 				return handled;
 			}
