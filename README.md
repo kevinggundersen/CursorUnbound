@@ -116,8 +116,39 @@ See the comments in `CursorUnbound.ini`. The settings most worth knowing:
 | `BlockGameCursorHide` | Stops the game re-hiding the OS cursor. Disable if it fights another mod. |
 | `HookAllModules` | Also intercepts `ShowCursor` calls from other DLLs (SSEDisplayTweaks, other SKSE plugins), not just the game executable. Turn off if another cursor mod stops working. |
 | `EnforceHiddenWhenInactive` | Keeps re-hiding the OS cursor while no menu wants it, rather than hiding it once on menu close. Turn off if a mod that wants a pointer during gameplay cannot show one. |
+| `SuppressPrismaCursor` | Blanks PrismaUI's own cursor sprite so it does not double up with the hardware one. |
+| `SuppressPartySheetCursor` | The same, for Skyrim Party Sheet. |
+| `TrackPartySheetPanels` | Shows the hardware cursor while a Party Sheet panel is open. See below. |
 
 Logs go to `Documents\My Games\Skyrim Special Edition\SKSE\CursorUnbound.log`.
+
+## Other UI frameworks
+
+Mods that draw their own pointer instead of using the game's cursor menu need explicit
+handling, because their sprite is drawn inside the game frame and so trails the hardware
+cursor. Two are handled:
+
+**PrismaUI** — its cursor sprite is blanked while this plugin is drawing one
+(`SuppressPrismaCursor`). Prisma views drive the cursor menu, so nothing else is needed.
+
+**[Skyrim Party Sheet](https://www.nexusmods.com/skyrimspecialedition/mods/167538)** — its
+panels are an ImGui overlay in the game's present hook, so they are invisible to every way
+this plugin normally detects that a pointer is wanted. Party Sheet broadcasts its panel
+state over SKSE messaging, and this plugin listens for it (`TrackPartySheetPanels`): while
+one of its interactive panels is open, the hardware cursor comes up and Party Sheet's own
+pointer is suppressed (`SuppressPartySheetCursor`).
+
+Party Sheet's horse picker is not covered — its API does not report that widget, so it
+keeps its own frame-locked pointer. That is why `SuppressPartySheetCursor = auto` only
+suppresses while this plugin is *active*, rather than for the whole session as Prisma's
+does: suppressing unconditionally would leave the horse picker with no pointer at all.
+
+Neither mod is a dependency. The detection half for Party Sheet is API-based and survives
+its updates; the suppression half is a signature (verified against **Party Sheet 3.1**,
+link stamp `0x6A68DAC1`) and will need revisiting when Party Sheet is rebuilt. A stale
+signature is designed to match nothing: the plugin logs a warning, leaves the other mod
+alone, and you get two pointers rather than a crash. The log lines to check are
+`resolved its cursor-draw function at +0x...` and `cursor sprite suppressed`.
 
 ## Troubleshooting
 

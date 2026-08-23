@@ -2,6 +2,7 @@
 
 #include "Config.h"
 #include "CursorImage.h"
+#include "PartySheetAPI.h"
 
 namespace CursorUnbound
 {
@@ -548,7 +549,16 @@ namespace CursorUnbound
 		}
 
 		// ---------------------------------------------------------------------------
-		// PrismaUI cursor suppression
+		// Third-party cursor suppression
+		//
+		// Some UI frameworks draw their own pointer instead of using the Scaleform cursor
+		// menu, which puts them out of reach of everything else in this file. Because they
+		// draw inside the frame, theirs trails the hardware cursor by a frame or more, and
+		// both on screen at once is what "double cursor" reports look like.
+		//
+		// Each such mod gets a CursorStub below: a module, a signature for the one function
+		// that draws the pointer, and a byte to write over its first instruction. The
+		// mechanism is shared; only the policy for when to apply it differs per mod.
 		//
 		// PrismaUI draws its own cursor: a DirectX sprite, blitted in the render loop from
 		// MenuCursor::cursorPosX/Y by PrismaUI::ViewRenderer::DrawCursor. It is neither a
@@ -572,9 +582,24 @@ namespace CursorUnbound
 
 		constexpr std::uint8_t kRetOpcode = 0xC3;
 
-		std::uint8_t* g_prismaDrawCursor = nullptr;
-		std::uint8_t  g_prismaOriginalByte = 0;
-		bool          g_prismaPatched = false;
+		// One suppressible cursor-drawing function in one foreign module.
+		//
+		// `label` is what the log calls this mod, and `noun` names what the player loses if
+		// the signature goes stale - both exist so a warning is actionable without knowing
+		// which stub emitted it.
+		struct CursorStub
+		{
+			const wchar_t* module;
+			const char*    label;
+			const char*    noun;
+			const int*     signature;
+			std::size_t    signatureLength;
+
+			std::uint8_t* site = nullptr;
+			std::uint8_t  originalByte = 0;
+			bool          patched = false;
+			bool          resolved = false;  // resolution was attempted, successfully or not
+		};
 
 		// PrismaUI::ViewRenderer::DrawCursor prologue:
 		//
@@ -590,11 +615,65 @@ namespace CursorUnbound
 		// across the whole .text section of the PrismaUI.dll this was developed against, where
 		// the function sits at +0x922C0. Re-check against every new PrismaUI release - a stale
 		// signature is meant to match nothing rather than match the wrong thing.
-		constexpr int kDrawCursorSig[] = {
+		constexpr int kPrismaDrawCursorSig[] = {
 			0x40, 0x56, 0x57, 0x48, 0x81, 0xEC, 0x28, 0x02, 0x00, 0x00,
 			0x48, 0x8B, 0x05,   -1,   -1,   -1,   -1,
 			0x48, 0x33, 0xC4,
 			0x48, 0x89, 0x84, 0x24, 0x10, 0x02, 0x00, 0x00,
+		};
+
+		// ImGuiRenderer::DrawSkyrimCursor prologue, from SkyrimPartySheet.dll:
+		//
+		//   48 89 7C 24 08           mov  [rsp+8], rdi
+		//   55                       push rbp
+		//   48 8D 6C 24 A9           lea  rbp, [rsp-0x57]
+		//   48 81 EC D0 00 00 00     sub  rsp, 0xD0
+		//   0F 29 B4 24 C0 00 00 00  movaps [rsp+0xC0], xmm6
+		//   48 8B 05 ?? ?? ?? ??     mov  rax, [rip+__security_cookie]
+		//   48 33 C4                 xor  rax, rsp
+		//   48 89 45 37              mov  [rbp+0x37], rax
+		//
+		// Same shape of signature and the same reasoning as Prisma's: the RIP displacement to
+		// the cookie moves with every build and is wildcarded, while the 0xD0 frame, the saved
+		// xmm6 and the cookie slot at [rbp+0x37] are what make it specific. Verified unique
+		// across the whole .text section of Party Sheet 3.1 (link stamp 0x6A68DAC1,
+		// 2026-07-28), where the function sits at +0x64E40.
+		//
+		// The function was identified by its only string reference,
+		// "Data\Interface\PartySheet\Icons\cursor.png", which the compiler inlines as SSE
+		// stores rather than a lea - so the string is not usable as a signature itself.
+		// Re-check against every new Party Sheet release.
+		//
+		// A RET on the first byte is a complete suppression here for the same reason it is for
+		// Prisma: it returns before the frame is established, so neither the /GS cookie nor the
+		// saved xmm6 is ever written, and the function returns void. Every other code path in
+		// Party Sheet writes io.MouseDrawCursor = false at the top of its frame, so stubbing
+		// the one place that would have set it true leaves no ImGui software cursor either.
+		constexpr int kPartySheetDrawCursorSig[] = {
+			0x48, 0x89, 0x7C, 0x24, 0x08,
+			0x55,
+			0x48, 0x8D, 0x6C, 0x24, 0xA9,
+			0x48, 0x81, 0xEC, 0xD0, 0x00, 0x00, 0x00,
+			0x0F, 0x29, 0xB4, 0x24, 0xC0, 0x00, 0x00, 0x00,
+			0x48, 0x8B, 0x05,   -1,   -1,   -1,   -1,
+			0x48, 0x33, 0xC4,
+			0x48, 0x89, 0x45, 0x37,
+		};
+
+		CursorStub g_prismaStub{
+			.module = L"PrismaUI.dll",
+			.label = "PrismaUI",
+			.noun = "Prisma menus",
+			.signature = kPrismaDrawCursorSig,
+			.signatureLength = std::size(kPrismaDrawCursorSig),
+		};
+
+		CursorStub g_partySheetStub{
+			.module = L"SkyrimPartySheet.dll",
+			.label = "Skyrim Party Sheet",
+			.noun = "Party Sheet panels",
+			.signature = kPartySheetDrawCursorSig,
+			.signatureLength = std::size(kPartySheetDrawCursorSig),
 		};
 
 		bool GetTextSection(HMODULE a_module, std::uint8_t*& a_outBegin, std::size_t& a_outSize)
@@ -719,89 +798,173 @@ namespace CursorUnbound
 				stamp, when, image.size);
 		}
 
-		void ResolvePrismaDrawCursor()
+		// Locating the draw function is done once per stub. A failure is remembered as an
+		// attempt so a missing module does not re-log on every policy application.
+		void ResolveCursorStub(CursorStub& a_stub)
 		{
-			if (g_prismaDrawCursor) {
+			if (a_stub.resolved) {
 				return;
 			}
+			a_stub.resolved = true;
 
-			HMODULE module = ::GetModuleHandleW(L"PrismaUI.dll");
+			HMODULE module = ::GetModuleHandleW(a_stub.module);
 			if (!module) {
-				SKSE::log::info("PrismaUI is not loaded; nothing to do about its cursor.");
+				SKSE::log::info("{} is not loaded; nothing to do about its cursor.", a_stub.label);
 				return;
 			}
 
 			std::uint8_t* text = nullptr;
 			std::size_t   size = 0;
 			if (!GetTextSection(module, text, size)) {
-				SKSE::log::warn("PrismaUI.dll has no readable .text section; leaving its cursor alone.");
+				SKSE::log::warn(
+					"{} has no readable .text section; leaving its cursor alone.", a_stub.label);
 				return;
 			}
 
 			const auto  build = DescribeModuleBuild(module);
 			std::size_t matches = 0;
-			auto*       found = FindPattern(text, size, kDrawCursorSig, std::size(kDrawCursorSig), matches);
+			auto* found = FindPattern(text, size, a_stub.signature, a_stub.signatureLength, matches);
 
 			if (matches != 1) {
 				SKSE::log::warn(
-					"PrismaUI.dll [{}] - DrawCursor signature matched {} time(s), expected exactly 1. "
-					"Leaving Prisma's cursor alone, so expect two pointers in Prisma menus. This "
-					"normally means PrismaUI has been updated and the signature needs revisiting.",
-					build, matches);
+					"{} [{}] - cursor-draw signature matched {} time(s), expected exactly 1. "
+					"Leaving its cursor alone, so expect two pointers in {}. This normally means "
+					"the mod has been updated and the signature needs revisiting.",
+					a_stub.label, build, matches, a_stub.noun);
 				return;
 			}
 
-			g_prismaDrawCursor = found;
-			g_prismaOriginalByte = *found;
+			a_stub.site = found;
+			a_stub.originalByte = *found;
 			SKSE::log::info(
-				"PrismaUI.dll [{}] - resolved ViewRenderer::DrawCursor at +0x{:X} (0x{:X}).",
+				"{} [{}] - resolved its cursor-draw function at +0x{:X} (0x{:X}).",
+				a_stub.label,
 				build,
 				static_cast<std::uintptr_t>(found - reinterpret_cast<std::uint8_t*>(module)),
 				reinterpret_cast<std::uintptr_t>(found));
 		}
 
-		void SetPrismaCursorSuppressed(bool a_suppress)
+		void SetCursorStubSuppressed(CursorStub& a_stub, bool a_suppress)
 		{
-			if (!g_prismaDrawCursor || g_prismaPatched == a_suppress) {
+			if (!a_stub.site || a_stub.patched == a_suppress) {
 				return;
 			}
 
-			const std::uint8_t byte = a_suppress ? kRetOpcode : g_prismaOriginalByte;
+			const std::uint8_t byte = a_suppress ? kRetOpcode : a_stub.originalByte;
 
 			DWORD previous = 0;
-			if (!::VirtualProtect(g_prismaDrawCursor, 1, PAGE_EXECUTE_READWRITE, &previous)) {
-				SKSE::log::warn(
-					"Could not unprotect PrismaUI's DrawCursor (error {}).", ::GetLastError());
+			if (!::VirtualProtect(a_stub.site, 1, PAGE_EXECUTE_READWRITE, &previous)) {
+				SKSE::log::warn("Could not unprotect {}'s cursor-draw function (error {}).",
+					a_stub.label, ::GetLastError());
 				return;
 			}
-			*g_prismaDrawCursor = byte;
-			::VirtualProtect(g_prismaDrawCursor, 1, previous, &previous);
-			::FlushInstructionCache(::GetCurrentProcess(), g_prismaDrawCursor, 1);
+			*a_stub.site = byte;
+			::VirtualProtect(a_stub.site, 1, previous, &previous);
+			::FlushInstructionCache(::GetCurrentProcess(), a_stub.site, 1);
 
-			g_prismaPatched = a_suppress;
-			SKSE::log::info("PrismaUI cursor sprite {}.", a_suppress ? "suppressed" : "restored");
+			a_stub.patched = a_suppress;
+			SKSE::log::info(
+				"{} cursor sprite {}.", a_stub.label, a_suppress ? "suppressed" : "restored");
 		}
 
 		bool WantPrismaCursorSuppressed()
 		{
 			const auto& config = Config::Get();
 			switch (config.suppressPrismaCursor) {
-			case PrismaSuppression::kOff:
+			case CursorSuppression::kOff:
 				return false;
-			case PrismaSuppression::kOn:
+			case CursorSuppression::kOn:
 				return true;
-			case PrismaSuppression::kAuto:
+			case CursorSuppression::kAuto:
 			default:
 				// Only while we are the ones drawing a pointer. In gamepad mode the cursor goes
 				// back to the game, and taking Prisma's away as well would leave none at all.
+				//
+				// Not gated on g_active, unlike Party Sheet below: a Prisma view drives the
+				// Cursor Menu, so any moment Prisma wants a pointer is a moment we are already
+				// active. Nothing is left uncovered by suppressing for the whole session.
 				return config.enabled && config.useHardwareCursor &&
 					   !g_gamepadMode.load(std::memory_order_relaxed);
 			}
 		}
 
+		bool WantPartySheetCursorSuppressed()
+		{
+			const auto& config = Config::Get();
+			switch (config.suppressPartySheetCursor) {
+			case CursorSuppression::kOff:
+				return false;
+			case CursorSuppression::kOn:
+				return true;
+			case CursorSuppression::kAuto:
+			default:
+				// Gated on being active, which Prisma's policy is not, and the difference
+				// matters. Party Sheet paints its pointer for widgets its API does not report -
+				// the horse picker is one - and those never bring us up. Suppressing for the
+				// whole session would leave them with no pointer at all, so this only takes
+				// their cursor away in the moments we are demonstrably drawing one instead.
+				return config.enabled && config.useHardwareCursor &&
+					   !g_gamepadMode.load(std::memory_order_relaxed) &&
+					   g_active.load(std::memory_order_relaxed);
+			}
+		}
+
 		void ApplyPrismaCursorPolicy()
 		{
-			SetPrismaCursorSuppressed(WantPrismaCursorSuppressed());
+			SetCursorStubSuppressed(g_prismaStub, WantPrismaCursorSuppressed());
+		}
+
+		void ApplyPartySheetCursorPolicy()
+		{
+			SetCursorStubSuppressed(g_partySheetStub, WantPartySheetCursorSuppressed());
+		}
+
+		// Called wherever either policy's inputs can have changed. Both are cheap and
+		// idempotent - SetCursorStubSuppressed early-outs unless the desired state actually
+		// differs from the applied one - so this is safe on the sync timer.
+		void ApplyCursorSuppressionPolicies()
+		{
+			ApplyPrismaCursorPolicy();
+			ApplyPartySheetCursorPolicy();
+		}
+
+		// ---------------------------------------------------------------------------
+		// Skyrim Party Sheet panel tracking
+		//
+		// Party Sheet's panels are an ImGui overlay drawn inside the game's present hook, not
+		// Scaleform menus. Nothing about them reaches the Cursor Menu or the menu stack, so
+		// MenusWantCursor cannot see them by any of its usual means and we would stay inactive
+		// for the entire time one is open - which is exactly when a smooth pointer is wanted.
+		//
+		// Party Sheet publishes its panel state over SKSE messaging, so no signature is
+		// involved in the detection half of this: only the suppression half above is
+		// build-sensitive. If Party Sheet is absent the interface never arrives, the mask
+		// stays zero, and every path here answers false.
+		// ---------------------------------------------------------------------------
+
+		// Published once at kPostPostLoad and valid for the life of the process - Party Sheet
+		// hands out a pointer to a function-local static.
+		std::atomic<PartySheetAPI::IPartySheetState1*> g_partySheetState{ nullptr };
+
+		// Fallback for the window between our listener registering and the interface arriving,
+		// and for a future Party Sheet that broadcasts state without dispatching an interface.
+		std::atomic<std::uint32_t> g_partySheetPanels{ 0 };
+
+		bool PartySheetWantsCursor()
+		{
+			if (!Config::Get().trackPartySheetPanels) {
+				return false;
+			}
+
+			// Prefer the live query. The broadcast is edge-triggered, so a cached mask is only
+			// ever as fresh as the last message we happened to receive; asking the interface
+			// cannot be stale by construction.
+			if (auto* state = g_partySheetState.load(std::memory_order_acquire)) {
+				return state->IsFullscreenPanelOpen();
+			}
+
+			return (g_partySheetPanels.load(std::memory_order_relaxed) &
+					   PartySheetAPI::kInteractivePanelMask) != 0;
 		}
 
 		// ---------------------------------------------------------------------------
@@ -1546,6 +1709,12 @@ namespace CursorUnbound
 
 		bool MenusWantCursor()
 		{
+			// Ahead of the UI singleton deliberately: a Party Sheet panel is not a menu, and
+			// whether the game's menu system is reachable has no bearing on it.
+			if (PartySheetWantsCursor()) {
+				return true;
+			}
+
 			auto* ui = RE::UI::GetSingleton();
 			if (!ui) {
 				return false;
@@ -1675,6 +1844,11 @@ namespace CursorUnbound
 			} else if (!shouldBeActive && isActive) {
 				Deactivate();
 			}
+
+			// After the decision, never before it: the Party Sheet policy reads g_active, so
+			// applying it first would suppress or restore against the previous frame's state
+			// and leave a frame showing either two pointers or none.
+			ApplyCursorSuppressionPolicies();
 		}
 
 		LRESULT CALLBACK WndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wparam, LPARAM a_lparam)
@@ -1886,7 +2060,14 @@ namespace CursorUnbound
 
 			const auto& config = Config::Get();
 
-			if (config.syncOnMenuOpen) {
+			// Not when a Party Sheet panel is what brought us up. The sync exists to stop the
+			// pointer jumping when a menu opens, by moving the OS cursor to wherever the
+			// game's menu cursor already sits - but a Party Sheet panel is not a game menu and
+			// never touched MenuCursor, so those coordinates are left over from the last real
+			// menu. Syncing to them would cause the jump rather than prevent it, and Party
+			// Sheet places its own hit-testing from the OS position, so there is nothing to
+			// reconcile with in the first place.
+			if (config.syncOnMenuOpen && !PartySheetWantsCursor()) {
 				SyncOsCursorToGame();
 			}
 
@@ -1962,11 +2143,11 @@ namespace CursorUnbound
 
 			SKSE::log::info("Gamepad cursor input detected - returning the cursor to the game.");
 
-			// Give the game its own pointer back and get ours off the screen. Prisma's sprite
-			// comes back too - with no hardware cursor there is nothing for it to double up.
+			// Give the game its own pointer back and get ours off the screen. The suppressed
+			// sprites come back too - with no hardware cursor there is nothing to double up.
 			SetScaleformCursorVisible(true, false);
 			ForceCursorHidden();
-			ApplyPrismaCursorPolicy();
+			ApplyCursorSuppressionPolicies();
 		}
 
 		void ExitGamepadMode()
@@ -1977,7 +2158,7 @@ namespace CursorUnbound
 
 			SKSE::log::info("Mouse input resumed - taking the cursor back.");
 
-			ApplyPrismaCursorPolicy();
+			ApplyCursorSuppressionPolicies();
 
 			const auto& config = Config::Get();
 			if (g_active.load(std::memory_order_relaxed) && config.useHardwareCursor) {
@@ -2158,8 +2339,9 @@ namespace CursorUnbound
 
 		// Independent of the window and of everything above it - kept out of HookWindowProc
 		// so a failure to find the game window does not also cost us this.
-		ResolvePrismaDrawCursor();
-		ApplyPrismaCursorPolicy();
+		ResolveCursorStub(g_prismaStub);
+		ResolveCursorStub(g_partySheetStub);
+		ApplyCursorSuppressionPolicies();
 
 		g_runtimeReady.store(true);
 
@@ -2172,9 +2354,10 @@ namespace CursorUnbound
 	{
 		Deactivate();
 
-		// Hand PrismaUI its own code back before we go, so a reloaded or unloaded plugin does
-		// not leave another mod permanently patched.
-		SetPrismaCursorSuppressed(false);
+		// Hand every patched mod its own code back before we go, so a reloaded or unloaded
+		// plugin does not leave another mod permanently stubbed.
+		SetCursorStubSuppressed(g_prismaStub, false);
+		SetCursorStubSuppressed(g_partySheetStub, false);
 
 		if (g_window && ::IsWindow(g_window)) {
 			::KillTimer(g_window, kSyncTimerId);
@@ -2195,6 +2378,72 @@ namespace CursorUnbound
 		}
 
 		g_runtimeReady.store(false);
+	}
+
+	void OnPartySheetMessage(std::uint32_t a_type, void* a_data, std::uint32_t a_dataLen)
+	{
+		if (!Config::Get().enabled) {
+			return;
+		}
+
+		switch (a_type) {
+		case PartySheetAPI::kMsg_Interface:
+			{
+				// The payload IS the interface pointer - Party Sheet passes it as the message
+				// data with dataLen set to sizeof(void*), not as a struct containing one.
+				auto* state = static_cast<PartySheetAPI::IPartySheetState1*>(a_data);
+				if (!state || a_dataLen != sizeof(void*)) {
+					SKSE::log::warn(
+						"Party Sheet sent an interface message with an unexpected payload "
+						"({} bytes, expected {}); ignoring it.", a_dataLen, sizeof(void*));
+					return;
+				}
+
+				// Ask before calling anything else through it. GetVersion is the second vtable
+				// slot in every version by construction, so it is the one virtual that is safe
+				// to call on an interface we have not yet agreed a layout with; the rest are
+				// only safe once it answers 1.
+				const auto version = state->GetVersion();
+				if (version != 1) {
+					SKSE::log::warn(
+						"Party Sheet's state interface reports version {}, and this build only "
+						"understands version 1. Not tracking its panels - update Cursor Unbound.",
+						version);
+					return;
+				}
+
+				g_partySheetState.store(state, std::memory_order_release);
+				SKSE::log::info(
+					"Skyrim Party Sheet detected; tracking its panels for cursor activation "
+					"(state interface v{}).", version);
+
+				// A panel can already be open by the time this arrives, so decide again rather
+				// than waiting for the next timer tick.
+				SyncActiveState(true);
+			}
+			break;
+
+		case PartySheetAPI::kMsg_State:
+			{
+				if (!a_data || a_dataLen < sizeof(PartySheetAPI::StateMsg)) {
+					return;
+				}
+				const auto* msg = static_cast<const PartySheetAPI::StateMsg*>(a_data);
+				if (msg->version != 1) {
+					return;
+				}
+				g_partySheetPanels.store(msg->openPanels, std::memory_order_relaxed);
+
+				// Edge-triggered, and therefore the earliest this can be known. Reacting here
+				// rather than on the next 32ms tick is the difference between the pointer
+				// appearing with the panel and appearing shortly after it.
+				SyncActiveState(true);
+			}
+			break;
+
+		default:
+			break;
+		}
 	}
 
 	void OnMenuOpenClose(std::string_view a_menuName, bool a_opening)

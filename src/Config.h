@@ -27,12 +27,14 @@ namespace CursorUnbound
 		kRender,       // skip the cursor movie's draw call outright (ignores every flag)
 	};
 
-	// Whether to neutralize PrismaUI's own cursor sprite.
-	enum class PrismaSuppression
+	// Whether to neutralize another mod's own cursor sprite. Shared by every overlay we
+	// know how to suppress; what kAuto means differs per mod and is documented at each
+	// Want*CursorSuppressed().
+	enum class CursorSuppression
 	{
-		// Suppress only while we are actually drawing a hardware cursor. This is the setting
-		// that avoids two pointers without taking Prisma's away from anyone who is not using
-		// ours.
+		// Suppress only while we are the ones drawing a pointer. This is the setting that
+		// avoids two pointers without taking the other mod's away from anyone who is not
+		// using ours.
 		kAuto,
 		kOn,
 		kOff,
@@ -78,7 +80,20 @@ namespace CursorUnbound
 		// from MenuCursor::cursorPosX/Y. It therefore inherits our absolute position but is
 		// still drawn at frame rate, so alongside the hardware cursor it reads as a second
 		// pointer lagging the first.
-		PrismaSuppression suppressPrismaCursor = PrismaSuppression::kAuto;
+		CursorSuppression suppressPrismaCursor = CursorSuppression::kAuto;
+		// Skyrim Party Sheet draws its panels as an ImGui overlay in the game's present
+		// hook, and paints its own pointer there from the OS cursor position. That pointer
+		// is correct but frame-locked, so alongside the hardware cursor it reads as a
+		// second one trailing the first.
+		//
+		// Unlike Prisma, kAuto here is gated on us being *active*: Party Sheet has widgets
+		// its API does not report (the horse picker), and suppressing their pointer while we
+		// are not showing one would leave those with no pointer at all.
+		CursorSuppression suppressPartySheetCursor = CursorSuppression::kAuto;
+		// Treat an open Party Sheet panel as a reason to show the hardware cursor. Off gives
+		// you the suppression setting above without the activation, which is only useful for
+		// working out which half of the pair is misbehaving.
+		bool              trackPartySheetPanels = true;
 		CoordinateSpace coordinateSpace = CoordinateSpace::kAuto;
 		// Manual escape hatch. When > 0 these override whatever the coordinate space
 		// resolution would have picked.

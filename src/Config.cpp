@@ -68,6 +68,20 @@ namespace CursorUnbound
 				return a_fallback;
 			}
 		}
+
+		// Anything that is not recognisably on or off means auto, so a typo lands on the
+		// setting that behaves itself rather than on a hard on/off the player did not ask for.
+		CursorSuppression ParseSuppression(const std::string& a_value)
+		{
+			const auto v = ToLower(a_value);
+			if (v == "on" || v == "true" || v == "1" || v == "yes") {
+				return CursorSuppression::kOn;
+			}
+			if (v == "off" || v == "false" || v == "0" || v == "no") {
+				return CursorSuppression::kOff;
+			}
+			return CursorSuppression::kAuto;
+		}
 	}
 
 	Config& Config::Get()
@@ -168,14 +182,11 @@ namespace CursorUnbound
 				} else if (key == "synconmenuopen") {
 					syncOnMenuOpen = ParseBool(value, syncOnMenuOpen);
 				} else if (key == "suppressprismacursor") {
-					const auto v = ToLower(value);
-					if (v == "on" || v == "true" || v == "1" || v == "yes") {
-						suppressPrismaCursor = PrismaSuppression::kOn;
-					} else if (v == "off" || v == "false" || v == "0" || v == "no") {
-						suppressPrismaCursor = PrismaSuppression::kOff;
-					} else {
-						suppressPrismaCursor = PrismaSuppression::kAuto;
-					}
+					suppressPrismaCursor = ParseSuppression(value);
+				} else if (key == "suppresspartysheetcursor") {
+					suppressPartySheetCursor = ParseSuppression(value);
+				} else if (key == "trackpartysheetpanels") {
+					trackPartySheetPanels = ParseBool(value, trackPartySheetPanels);
 				} else if (key == "coordinatespace") {
 					const auto v = ToLower(value);
 					if (v == "game") {

@@ -33,6 +33,15 @@ Statically linked into the plugin (CommonLibSSE-NG dependencies, new in v1.0.5).
 <https://github.com/microsoft/DirectXTK> and <https://github.com/microsoft/DirectXMath> —
 MIT License. Copyright (c) Microsoft Corporation.
 
+## Skyrim Party Sheet (interop only)
+
+Not linked, not bundled, not required. `src/PartySheetAPI.h` declares the subset of Party
+Sheet's SKSE messaging API that this plugin consumes, mirroring `includes/PartySheetStateAPI.h`
+from its source release.
+
+<https://www.nexusmods.com/skyrimspecialedition/mods/167538> — MIT License.
+Copyright (c) 2025 Rijosan.
+
 ## Bundled cursor art
 
 `SKSE/Plugins/CursorUnbound/cursor.png` and `cursor_48.png` are derived from

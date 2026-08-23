@@ -48,6 +48,7 @@ set(SOURCES
 	src/CursorImage.cpp
 	src/CursorUnbound.h
 	src/CursorUnbound.cpp
+	src/PartySheetAPI.h
 	src/main.cpp
 )
 

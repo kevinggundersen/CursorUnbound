@@ -1,5 +1,6 @@
 #include "Config.h"
 #include "CursorUnbound.h"
+#include "PartySheetAPI.h"
 
 namespace
 {
@@ -66,6 +67,18 @@ namespace
 		MenuWatcher() = default;
 	};
 
+	// Skyrim Party Sheet dispatches under its own sender name, so this cannot be folded into
+	// OnMessage: RegisterListener with a callback alone subscribes to sender "SKSE" and
+	// nothing else, and a listener registered for one sender never sees another's traffic.
+	void OnPartySheetMessage(SKSE::MessagingInterface::Message* a_message)
+	{
+		if (!a_message) {
+			return;
+		}
+
+		CursorUnbound::OnPartySheetMessage(a_message->type, a_message->data, a_message->dataLen);
+	}
+
 	void OnMessage(SKSE::MessagingInterface::Message* a_message)
 	{
 		if (!a_message) {
@@ -73,6 +86,29 @@ namespace
 		}
 
 		switch (a_message->type) {
+		case SKSE::MessagingInterface::kPostLoad:
+			{
+				// Not in SKSEPluginLoad, which is where this would naturally go. SKSE resolves
+				// a named sender to a plugin handle at registration time and fails outright if
+				// that plugin is not loaded yet - and plugins load in filename order, so
+				// CursorUnbound.dll is loaded before SkyrimPartySheet.dll every time. Doing it
+				// here, once every plugin is loaded and before Party Sheet dispatches its
+				// interface at kPostPostLoad, is the only ordering that works.
+				//
+				// Failure is the ordinary case when Party Sheet is not installed, and nothing
+				// else is affected by it. CommonLibSSE logs its own "Failed to register
+				// messaging listener" at error level from inside RegisterListener before we
+				// get to answer, so the info line below exists to say that line was expected.
+				if (const auto* messaging = SKSE::GetMessagingInterface();
+					messaging && messaging->RegisterListener(PartySheetAPI::kSender, OnPartySheetMessage)) {
+					SKSE::log::info("Listening for Skyrim Party Sheet's panel state.");
+				} else {
+					SKSE::log::info(
+						"Skyrim Party Sheet is not installed; not listening for its panel state.");
+				}
+			}
+			break;
+
 		case SKSE::MessagingInterface::kDataLoaded:
 			{
 				if (!CursorUnbound::Config::Get().enabled) {
