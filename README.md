@@ -33,10 +33,17 @@ glide — the thing that actually reads as sluggish — is not.
 
 ## Requirements
 
-- Skyrim Special Edition or Anniversary Edition (built and tested against runtime
-  **1.6.1170**; the DLL is address-library based and covers SE and AE generally)
-- SKSE64
-- Address Library for SKSE Plugins
+- Skyrim Special Edition or Anniversary Edition (developed against runtime **1.6.1170**;
+  the DLL is address-library based and covers SE and AE generally, including **1.7.99**)
+- SKSE64 — 2.3.0 or later on 1.7.99
+- Address Library for SKSE Plugins — on 1.7.99 you need a build that contains
+  `versionlib-1-7-99-0.bin`
+
+**On 1.7.99** the game inserted two new virtuals into `MenuEventHandler`, shifting the two
+slots this plugin hooks down by two. The plugin detects the runtime and picks the right
+slots; the log line `Hooked CursorMenu::ProcessMouseMove (vfunc 0x6)` reports which pair it
+resolved to (`0x6`/`0x5` on 1.7.99, `0x4`/`0x3` below it). If the cursor does nothing on a
+future runtime, that line is the first thing to check.
 
 **Skyrim VR is not supported.** In VR builds CommonLibSSE strips `MenuEventHandler` off
 `CursorMenu`, which removes the virtual this plugin hooks. VR would need a different
@@ -221,11 +228,11 @@ be uploaded there manually.
 
 | Piece | Mechanism |
 | --- | --- |
-| Position | Vtable detour on `CursorMenu::ProcessMouseMove` (`VTABLE_CursorMenu[1]`, index 4). Writes `MenuCursor::cursorPosX/Y` from `GetCursorPos` **before** calling the original, with the event delta zeroed for the duration of that call and restored afterwards. |
+| Position | Vtable detour on `CursorMenu::ProcessMouseMove` (`VTABLE_CursorMenu[1]`, index 4; 6 on 1.7.99 and later). Writes `MenuCursor::cursorPosX/Y` from `GetCursorPos` **before** calling the original, with the event delta zeroed for the duration of that call and restored afterwards. |
 | Drawing | `SetVisible(false)` plus `_root._visible = false` and `_root._alpha = 0` on the Cursor Menu movie; the Win32 hardware cursor draws instead. |
 | Visibility | IAT patch on `USER32!ShowCursor` to swallow the game's hide calls, plus a 15 ms `WM_TIMER` in a subclassed window procedure that re-asserts the display counter and the cursor image. The timer is what makes this work without mouse input - `WM_SETCURSOR` only arrives once the pointer moves, so on its own it cannot bring the cursor up on a menu that just opened. |
 | Art | WIC decode to 32bpp PBGRA, `CreateIconIndirect` with an all-zero AND mask so the alpha channel drives blending. |
-| Gamepad | Vtable detour on `ProcessThumbstick` (same vtable, index 3). A stick past a deadzone hands the cursor back to the game; any real mouse delta takes it back. |
+| Gamepad | Vtable detour on `ProcessThumbstick` (same vtable, index 3; 5 on 1.7.99 and later). A stick past a deadzone hands the cursor back to the game; any real mouse delta takes it back. |
 
 The draw suppression holds a `GPtr` strong reference to the movie it is suppressing, not
 just a raw pointer. Without it the movie could be freed and a different movie allocated at
@@ -243,3 +250,26 @@ position *after* it returns leaves the drawn cursor and the hit-test following t
 fps-scaled integration while `MenuCursor` holds the absolute value. The two disagree every
 frame, which reads as jitter. Writing before — with the delta zeroed so the original does
 not integrate on top — is what makes Scaleform agree with the OS position.
+
+## License
+
+Copyright (c) 2026 Datsferg
+
+Cursor Unbound is free software: you can redistribute it and/or modify it under the terms
+of the GNU General Public License as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the GNU General Public License for more details. You should have received a copy of
+the GNU General Public License along with this program. If not, see
+<https://www.gnu.org/licenses/>.
+
+**This project was MIT-licensed through v1.0.4.** It moved to GPL-3.0-or-later in v1.0.5,
+when the CommonLibSSE-NG dependency switched to the maintained
+[alandtse fork](https://github.com/alandtse/CommonLibSSE-NG) to gain runtime 1.7.99
+support. That fork is GPL-3.0-or-later and is statically linked, so the distributed DLL is
+a combined work and has to be distributed under GPL terms. Releases up to and including
+v1.0.4 remain available under MIT.
+
+See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for bundled and linked components.

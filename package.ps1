@@ -108,7 +108,8 @@ TROUBLESHOOTING
   Reporting a bug: set Verbose = true in the ini and attach CursorUnbound.log.
 
 SOURCE / LICENSE
-  MIT. See LICENSE and THIRD-PARTY-NOTICES.md.
+  GPL-3.0-or-later. See LICENSE and THIRD-PARTY-NOTICES.md.
+  Built on CommonLibSSE-NG (GPL-3.0-or-later), statically linked.
   Bundled cursor art derived from ESO Style Cursor under its open permissions.
 "@
 Set-Content -Path (Join-Path $stage "README.txt") -Value $readme -Encoding UTF8

@@ -104,7 +104,7 @@ SKSEPluginInfo(
 		CURSOR_UNBOUND_VERSION_PATCH,
 		0 },
 	.Name = "CursorUnbound"sv,
-	.Author = "kevin"sv,
+	.Author = "Datsferg"sv,
 	.RuntimeCompatibility = SKSE::VersionIndependence::AddressLibrary)
 
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)

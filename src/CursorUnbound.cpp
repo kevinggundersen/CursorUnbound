@@ -2108,9 +2108,27 @@ namespace CursorUnbound
 	void InstallHooks()
 	{
 		REL::Relocation<std::uintptr_t> vtable{ RE::VTABLE_CursorMenu[1] };
-		ProcessMouseMoveHook::func = vtable.write_vfunc(0x4, ProcessMouseMoveHook::thunk);
-		ProcessThumbstickHook::func = vtable.write_vfunc(0x3, ProcessThumbstickHook::thunk);
-		SKSE::log::info("Hooked CursorMenu::ProcessMouseMove and ProcessThumbstick.");
+
+		// 1.7.99 inserted ProcessMotionGesture and ProcessSixaxis into MenuEventHandler
+		// directly after CanProcess, pushing everything below them down by two slots.
+		// CommonLibSSE applies the same shift to its own MenuEventHandler wrappers (see
+		// AE1799_SLOT_SHIFT in RE/M/MenuEventHandler.h); we patch the vtable by raw index,
+		// so the shift has to be repeated here. Getting this wrong is silent rather than
+		// loud - the pre-shift indices land on the two new virtuals, so the mouse hook
+		// simply never fires and a sixaxis event arrives typed as a MouseMoveEvent.
+		const std::size_t shift = REL::Module::IsAtLeast(SKSE::RUNTIME_SSE_1_7_99) ? 2 : 0;
+		const std::size_t mouseMoveIndex = 0x4 + shift;
+		const std::size_t thumbstickIndex = 0x3 + shift;
+
+		ProcessMouseMoveHook::func = vtable.write_vfunc(mouseMoveIndex, ProcessMouseMoveHook::thunk);
+		ProcessThumbstickHook::func = vtable.write_vfunc(thumbstickIndex, ProcessThumbstickHook::thunk);
+
+		// The resolved indices are logged because they are the first thing worth checking
+		// when the cursor does nothing on a runtime this build has not been tested against.
+		SKSE::log::info(
+			"Hooked CursorMenu::ProcessMouseMove (vfunc {:#x}) and ProcessThumbstick (vfunc {:#x}).",
+			mouseMoveIndex,
+			thumbstickIndex);
 
 		if (Config::Get().blockGameCursorHide) {
 			// The executable first, so its original is the one we keep as the real function.

@@ -10,12 +10,12 @@ endif()
 
 project(
 	CursorUnbound
-	VERSION 1.0.4
+	VERSION 1.0.5
 	DESCRIPTION "Decouples the Skyrim menu cursor from the game frame rate."
 	LANGUAGES CXX RC
 )
 
-set(PROJECT_AUTHOR "kevin")
+set(PROJECT_AUTHOR "Datsferg")
 set(PROJECT_FRIENDLY_NAME "Cursor Unbound")
 
 # Stamps the DLL so a build can be identified from a crash log.
