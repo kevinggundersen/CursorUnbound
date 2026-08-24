@@ -119,6 +119,7 @@ See the comments in `CursorUnbound.ini`. The settings most worth knowing:
 | `SuppressPrismaCursor` | Blanks PrismaUI's own cursor sprite so it does not double up with the hardware one. |
 | `SuppressPartySheetCursor` | The same, for Skyrim Party Sheet. |
 | `TrackPartySheetPanels` | Shows the hardware cursor while a Party Sheet panel is open. See below. |
+| `SuppressGridInventoryCursor` | The same, for Grid Inventory's ImGui pointer. Falls back to standing our own cursor down if its signature goes stale. |
 
 Logs go to `Documents\My Games\Skyrim Special Edition\SKSE\CursorUnbound.log`.
 
@@ -126,7 +127,7 @@ Logs go to `Documents\My Games\Skyrim Special Edition\SKSE\CursorUnbound.log`.
 
 Mods that draw their own pointer instead of using the game's cursor menu need explicit
 handling, because their sprite is drawn inside the game frame and so trails the hardware
-cursor. Two are handled:
+cursor. Three are handled:
 
 **PrismaUI** — its cursor sprite is blanked while this plugin is drawing one
 (`SuppressPrismaCursor`). Prisma views drive the cursor menu, so nothing else is needed.
@@ -143,12 +144,46 @@ keeps its own frame-locked pointer. That is why `SuppressPartySheetCursor = auto
 suppresses while this plugin is *active*, rather than for the whole session as Prisma's
 does: suppressing unconditionally would leave the horse picker with no pointer at all.
 
-Neither mod is a dependency. The detection half for Party Sheet is API-based and survives
-its updates; the suppression half is a signature (verified against **Party Sheet 3.1**,
-link stamp `0x6A68DAC1`) and will need revisiting when Party Sheet is rebuilt. A stale
-signature is designed to match nothing: the plugin logs a warning, leaves the other mod
-alone, and you get two pointers rather than a crash. The log lines to check are
-`resolved its cursor-draw function at +0x...` and `cursor sprite suppressed`.
+**[Grid Inventory](https://www.nexusmods.com/skyrimspecialedition/mods/188733)** — replaces
+the inventory with a Dear ImGui grid, hides the game's Scaleform cursor itself and draws its
+own arrow at the end of its frame (`SuppressGridInventoryCursor`).
+
+Nothing extra is needed to make the grid smooth. Its menu carries `kUsesCursor` and opens the
+cursor menu itself, so this plugin is already active while it is up and already feeding it
+absolute positions — Grid Inventory reads the same `MenuCursor` fields this plugin writes.
+Only the second pointer needed solving.
+
+That suppression works differently from the other two, and the difference is worth knowing if
+you are updating the signature. Prisma and Party Sheet each keep their cursor draw in a
+function of its own, so a `RET` over its first byte is a complete and reversible suppression.
+Grid Inventory's `DrawPointer` is inlined into the function that draws its entire interface —
+there is no function to stub without taking the whole menu with it. What is still reachable is
+the guard that function opens with: ImGui parks an unknown mouse position off screen, and the
+pointer is not drawn there. Raising that off-screen threshold to `FLT_MAX` makes the
+comparison true for every real cursor position, so the pointer is skipped by Grid Inventory's
+own early-out, on the compiler's own branch, with nothing else in the frame touched. It is
+also the safer write: four aligned bytes of read-only data, which the render thread reading it
+every frame cannot observe half-applied, where the equivalent code patch would be six bytes
+over a live instruction.
+
+Because that is a data write rather than a code write, it gets one extra check the other two
+do not need — the constant must actually hold the value the guard is documented to compare
+against (`-1000.0`) before anything is written. A signature that has drifted onto an unrelated
+constant refuses instead of corrupting it.
+
+None of the three is a dependency. The detection half for Party Sheet is API-based and
+survives its updates; every suppression half is a signature (verified against **Party Sheet
+3.1**, link stamp `0x6A68DAC1`, and **Grid Inventory 1.4.3**) and will need revisiting when
+those mods are rebuilt. A stale signature is designed to match nothing: the plugin logs a
+warning, leaves the other mod alone, and you get two pointers rather than a crash. The log
+lines to check are `resolved its cursor-draw function at +0x...`, `resolved its pointer guard
+at +0x...` and `cursor suppressed`.
+
+Grid Inventory has one more layer, because it is updated often and its signature sits inside
+an inlined function. If it fails to resolve, this plugin stands its *own* hardware cursor down
+while the grid is open rather than leaving two on screen. You get one pointer, drawn by Grid
+Inventory at the game's frame rate — still correctly positioned, just not smooth, and only
+inside the grid. The log says `the hardware cursor is standing down` when that happens.
 
 ## Troubleshooting
 

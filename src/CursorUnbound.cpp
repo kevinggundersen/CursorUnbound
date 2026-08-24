@@ -32,6 +32,17 @@ namespace CursorUnbound
 		// while a stick is driving the cursor we hand rendering back to the game entirely.
 		std::atomic<bool> g_gamepadMode{ false };
 
+		// A mod that draws its own pointer is on screen and we have chosen to let it keep
+		// drawing rather than take its pointer away. See ShouldYieldPointer, which is the only
+		// thing that writes this.
+		//
+		// Distinct from gamepad mode, which hands the cursor back to the game completely. Here
+		// we still drive the position absolutely and still keep the Scaleform cursor down,
+		// because the mod reads the same MenuCursor fields we write and so inherits the
+		// frame-rate independent sensitivity from us. The only thing given up is drawing a
+		// pointer of our own on top of theirs.
+		std::atomic<bool> g_yieldPointer{ false };
+
 		struct Diagnostics
 		{
 			std::uint64_t activations = 0;
@@ -220,8 +231,11 @@ namespace CursorUnbound
 		{
 			// Not while a gamepad owns the cursor - the game needs its own pointer back,
 			// and blocking its hide calls there would leave the OS cursor stranded on screen.
+			// Yielding to a mod that draws its own pointer is the same situation for the same
+			// reason: we want the OS cursor gone, so hide calls have to get through.
 			if (!a_show && g_active.load(std::memory_order_relaxed) &&
 				!g_gamepadMode.load(std::memory_order_relaxed) &&
+				!g_yieldPointer.load(std::memory_order_relaxed) &&
 				Config::Get().blockGameCursorHide && Config::Get().useHardwareCursor) {
 				return -1;
 			}
@@ -582,7 +596,34 @@ namespace CursorUnbound
 
 		constexpr std::uint8_t kRetOpcode = 0xC3;
 
-		// One suppressible cursor-drawing function in one foreign module.
+		// What gets written, and therefore what the signature has to point at.
+		//
+		// kFunctionRet is the shape the first two stubs take: the mod keeps its cursor draw in
+		// a function of its own, the signature matches that function's prologue, and a RET over
+		// the first byte is a complete suppression.
+		//
+		// kFloatConstant exists because that shape is not guaranteed. When the compiler inlines
+		// the draw into its caller there is no prologue to return from and no function to stub -
+		// the enclosing function draws the entire UI, so a RET there would take the whole menu
+		// with it. What remains reachable is the guard the mod's own author wrote at the top of
+		// the draw: if it opens by comparing the cursor position against a float constant and
+		// returning when it fails, raising that constant makes the guard always fire, and the
+		// pointer is skipped by the mod's own early-out. The signature then matches the guard,
+		// and the constant patched is whichever one the guard's own instruction points at, read
+		// out of its RIP displacement rather than hardcoded.
+		//
+		// The constant is also the safer thing to write. It is four bytes, naturally aligned,
+		// and read fresh every frame by the render thread - so a single aligned 32-bit store is
+		// atomic against that reader and can never be observed half-applied. The equivalent
+		// code patch would be a six-byte write over a live instruction, which has no such
+		// guarantee.
+		enum class StubPatch
+		{
+			kFunctionRet,
+			kFloatConstant,
+		};
+
+		// One suppressible cursor draw in one foreign module.
 		//
 		// `label` is what the log calls this mod, and `noun` names what the player loses if
 		// the signature goes stale - both exist so a warning is actionable without knowing
@@ -594,9 +635,19 @@ namespace CursorUnbound
 			const char*    noun;
 			const int*     signature;
 			std::size_t    signatureLength;
+			StubPatch      patch = StubPatch::kFunctionRet;
+
+			// kFloatConstant only. `expected` is the value the guard must currently hold and is
+			// verified before anything is written, so a signature that has drifted onto an
+			// unrelated constant refuses rather than corrupting it. `replacement` is the value
+			// that makes the guard always fire.
+			float expected = 0.0f;
+			float replacement = 0.0f;
 
 			std::uint8_t* site = nullptr;
-			std::uint8_t  originalByte = 0;
+			std::size_t   length = 1;  // bytes at `site` that this stub owns
+			std::uint8_t  originalBytes[4]{};
+			std::uint8_t  patchBytes[4]{};
 			bool          patched = false;
 			bool          resolved = false;  // resolution was attempted, successfully or not
 		};
@@ -660,6 +711,54 @@ namespace CursorUnbound
 			0x48, 0x89, 0x45, 0x37,
 		};
 
+		// Grid Inventory's pointer guard, from GridInventory.dll.
+		//
+		// Grid Inventory replaces the inventory with a Dear ImGui grid. It hides the Scaleform
+		// cursor itself, every frame, and draws its own arrow onto the ImGui foreground list at
+		// the end of the frame - so alongside the hardware cursor it reads as a second pointer
+		// trailing the first, exactly like Prisma's and Party Sheet's.
+		//
+		// Unlike those two it cannot be stubbed with a RET, and that is the whole reason this
+		// patch kind exists. Its DrawPointer is a small static function called from one place,
+		// and the compiler inlines it into the function that draws every window in the mod. The
+		// first byte of that function belongs to the entire UI, not to the pointer.
+		//
+		// What it does still have is the guard DrawPointer opens with - ImGui parks an unknown
+		// mouse position far off screen, and the pointer is not drawn there:
+		//
+		//   F3 0F 10 05 ?? ?? ?? ??     movss  xmm0, [rip+kOffscreen]   ; -1000.0f
+		//   F3 44 0F 10 80 D8 00 00 00  movss  xmm8, [rax+0xD8]         ; io.MousePos.x
+		//   41 0F 2F C0                 comiss xmm0, xmm8
+		//   0F 87 ?? ?? ?? ??           ja     past the pointer
+		//   0F 29 BC 24 F0 00 00 00     movaps [rsp+0xF0], xmm7
+		//   F3 0F 10 B8 DC 00 00 00     movss  xmm7, [rax+0xDC]         ; io.MousePos.y
+		//   0F 2F C7                    comiss xmm0, xmm7
+		//   0F 87 ?? ?? ?? ??           ja     past the pointer
+		//
+		// Raising that -1000.0f to FLT_MAX makes the first comparison true for every finite
+		// cursor position, so the branch the author already wrote is taken every frame and the
+		// pointer is never drawn. Nothing else in the frame is touched: the branch target is the
+		// compiler's own, not one we picked, and it lands on the ImGui::Render call immediately
+		// after the pointer.
+		//
+		// Both RIP displacements are wildcarded because they move with every build. What makes
+		// the signature specific is the pair of guarded comparisons against MousePos.x and .y at
+		// +0xD8/+0xDC and the xmm7 spill at [rsp+0xF0]. Verified unique across the whole .text
+		// section of Grid Inventory 1.4.3 (link stamp image 0x2F6000, Nexus 188733), where the
+		// guard sits at +0x7376B and the constant it reads at +0x23D5C8 - and that constant is
+		// referenced from exactly one instruction in the entire module, which is what makes it
+		// safe to write. Re-check both against every new Grid Inventory release.
+		constexpr int kGridInventoryPointerSig[] = {
+			0xF3, 0x0F, 0x10, 0x05,   -1,   -1,   -1,   -1,
+			0xF3, 0x44, 0x0F, 0x10, 0x80, 0xD8, 0x00, 0x00, 0x00,
+			0x41, 0x0F, 0x2F, 0xC0,
+			0x0F, 0x87,   -1,   -1,   -1,   -1,
+			0x0F, 0x29, 0xBC, 0x24, 0xF0, 0x00, 0x00, 0x00,
+			0xF3, 0x0F, 0x10, 0xB8, 0xDC, 0x00, 0x00, 0x00,
+			0x0F, 0x2F, 0xC7,
+			0x0F, 0x87,   -1,   -1,   -1,   -1,
+		};
+
 		CursorStub g_prismaStub{
 			.module = L"PrismaUI.dll",
 			.label = "PrismaUI",
@@ -674,6 +773,20 @@ namespace CursorUnbound
 			.noun = "Party Sheet panels",
 			.signature = kPartySheetDrawCursorSig,
 			.signatureLength = std::size(kPartySheetDrawCursorSig),
+		};
+
+		CursorStub g_gridInventoryStub{
+			.module = L"GridInventory.dll",
+			.label = "Grid Inventory",
+			.noun = "the grid inventory",
+			.signature = kGridInventoryPointerSig,
+			.signatureLength = std::size(kGridInventoryPointerSig),
+			.patch = StubPatch::kFloatConstant,
+			.expected = -1000.0f,
+			// Any finite MousePos compares below this, so the guard fires on every frame the
+			// pointer would have been drawn on. Not infinity: an unordered compare leaves the
+			// branch untaken, which is the one outcome that would draw the pointer anyway.
+			.replacement = (std::numeric_limits<float>::max)(),
 		};
 
 		bool GetTextSection(HMODULE a_module, std::uint8_t*& a_outBegin, std::size_t& a_outSize)
@@ -834,14 +947,86 @@ namespace CursorUnbound
 				return;
 			}
 
-			a_stub.site = found;
-			a_stub.originalByte = *found;
+			if (a_stub.patch == StubPatch::kFunctionRet) {
+				a_stub.site = found;
+				a_stub.length = 1;
+				a_stub.originalBytes[0] = *found;
+				a_stub.patchBytes[0] = kRetOpcode;
+				SKSE::log::info(
+					"{} [{}] - resolved its cursor-draw function at +0x{:X} (0x{:X}).",
+					a_stub.label,
+					build,
+					static_cast<std::uintptr_t>(found - reinterpret_cast<std::uint8_t*>(module)),
+					reinterpret_cast<std::uintptr_t>(found));
+				return;
+			}
+
+			// kFloatConstant. The signature begins on the guard's own load:
+			//
+			//   F3 0F 10 05 <disp32>   movss xmm0, [rip+disp32]
+			//
+			// so the constant is 8 bytes on (the length of that instruction, which is what RIP
+			// holds by the time the displacement is applied) plus the displacement. Taking it
+			// from the instruction rather than from a stored offset is the point: the constant
+			// pool moves with every build, and this way we always patch whatever this specific
+			// guard reads, or nothing at all.
+			std::int32_t displacement = 0;
+			std::memcpy(&displacement, found + 4, sizeof(displacement));
+			auto* constant = found + 8 + displacement;
+
+			// Everything from here is derived from bytes in somebody else's module, so none of
+			// it is trusted: the address has to land inside the image, and on a 4-byte boundary,
+			// or the store below would be neither safe nor atomic.
+			ModuleImage image{};
+			if (!OpenModuleImage(module, image)) {
+				SKSE::log::warn("{} [{}] - unreadable PE header; leaving its cursor alone.",
+					a_stub.label, build);
+				return;
+			}
+
+			// Ordered so the range check happens before the subtraction that assumes it: a
+			// displacement pointing below the image would make `constant - image.base` a
+			// meaningless difference rather than an offset.
+			const auto rva = constant >= image.base
+				? static_cast<std::uint64_t>(constant - image.base)
+				: 0;
+			if (constant < image.base || !image.Contains(rva, sizeof(float)) ||
+				(reinterpret_cast<std::uintptr_t>(constant) % alignof(float)) != 0) {
+				SKSE::log::warn(
+					"{} [{}] - its pointer guard reads 0x{:X}, which is not an aligned address "
+					"inside the module. Leaving its cursor alone, so expect two pointers in {}.",
+					a_stub.label, build, reinterpret_cast<std::uintptr_t>(constant), a_stub.noun);
+				return;
+			}
+
+			// The last check, and the one that makes a drifted signature harmless rather than
+			// destructive: a match that points at a constant holding something other than the
+			// value the guard is documented to compare against is not this guard, whatever the
+			// surrounding bytes looked like.
+			float current = 0.0f;
+			std::memcpy(&current, constant, sizeof(current));
+			if (current != a_stub.expected) {
+				SKSE::log::warn(
+					"{} [{}] - its pointer guard reads {} where {} was expected, so this is not "
+					"the constant the signature was written for. Leaving its cursor alone, so "
+					"expect two pointers in {}. This normally means the mod has been updated and "
+					"the signature needs revisiting.",
+					a_stub.label, build, current, a_stub.expected, a_stub.noun);
+				return;
+			}
+
+			a_stub.site = constant;
+			a_stub.length = sizeof(float);
+			std::memcpy(a_stub.originalBytes, &a_stub.expected, sizeof(float));
+			std::memcpy(a_stub.patchBytes, &a_stub.replacement, sizeof(float));
 			SKSE::log::info(
-				"{} [{}] - resolved its cursor-draw function at +0x{:X} (0x{:X}).",
+				"{} [{}] - resolved its pointer guard at +0x{:X}, reading the constant at "
+				"+0x{:X} (0x{:X}).",
 				a_stub.label,
 				build,
-				static_cast<std::uintptr_t>(found - reinterpret_cast<std::uint8_t*>(module)),
-				reinterpret_cast<std::uintptr_t>(found));
+				static_cast<std::uintptr_t>(found - image.base),
+				rva,
+				reinterpret_cast<std::uintptr_t>(constant));
 		}
 
 		void SetCursorStubSuppressed(CursorStub& a_stub, bool a_suppress)
@@ -850,21 +1035,40 @@ namespace CursorUnbound
 				return;
 			}
 
-			const std::uint8_t byte = a_suppress ? kRetOpcode : a_stub.originalByte;
+			const std::uint8_t* bytes = a_suppress ? a_stub.patchBytes : a_stub.originalBytes;
+			const bool          isCode = a_stub.patch == StubPatch::kFunctionRet;
 
+			// Code gets execute permission back, a constant does not - there is no reason to
+			// leave a page of somebody else's .rdata executable behind us.
 			DWORD previous = 0;
-			if (!::VirtualProtect(a_stub.site, 1, PAGE_EXECUTE_READWRITE, &previous)) {
-				SKSE::log::warn("Could not unprotect {}'s cursor-draw function (error {}).",
+			if (!::VirtualProtect(a_stub.site, a_stub.length,
+					isCode ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE, &previous)) {
+				SKSE::log::warn("Could not unprotect {}'s cursor draw (error {}).",
 					a_stub.label, ::GetLastError());
 				return;
 			}
-			*a_stub.site = byte;
-			::VirtualProtect(a_stub.site, 1, previous, &previous);
-			::FlushInstructionCache(::GetCurrentProcess(), a_stub.site, 1);
+
+			// Both widths are written in one naturally aligned store, and that is deliberate
+			// rather than incidental: the render thread reads this every frame while we write
+			// it, and on x86-64 an aligned store of one or four bytes is the width at which it
+			// cannot be observed half-applied. Alignment of the four-byte case was checked when
+			// the stub resolved.
+			if (a_stub.length == sizeof(std::uint32_t)) {
+				std::uint32_t value = 0;
+				std::memcpy(&value, bytes, sizeof(value));
+				*reinterpret_cast<volatile std::uint32_t*>(a_stub.site) = value;
+			} else {
+				*reinterpret_cast<volatile std::uint8_t*>(a_stub.site) = bytes[0];
+			}
+
+			::VirtualProtect(a_stub.site, a_stub.length, previous, &previous);
+			if (isCode) {
+				::FlushInstructionCache(::GetCurrentProcess(), a_stub.site, a_stub.length);
+			}
 
 			a_stub.patched = a_suppress;
 			SKSE::log::info(
-				"{} cursor sprite {}.", a_stub.label, a_suppress ? "suppressed" : "restored");
+				"{} cursor {}.", a_stub.label, a_suppress ? "suppressed" : "restored");
 		}
 
 		bool WantPrismaCursorSuppressed()
@@ -909,6 +1113,92 @@ namespace CursorUnbound
 			}
 		}
 
+		bool WantGridInventoryCursorSuppressed()
+		{
+			const auto& config = Config::Get();
+			switch (config.suppressGridInventoryCursor) {
+			case CursorSuppression::kOff:
+				return false;
+			case CursorSuppression::kOn:
+				return true;
+			case CursorSuppression::kAuto:
+			default:
+				// Gated on being active, like Party Sheet rather than like Prisma, but for a
+				// different reason: the grid menu carries kUsesCursor and opens the Cursor Menu
+				// itself, so we come up a frame or two after it does. Suppressing for the whole
+				// session would leave those frames with no pointer at all, and the ones after
+				// them are covered anyway.
+				//
+				// The gamepad gate is doing more work here than in the two policies above. Grid
+				// Inventory has a whole pad-cursor mode whose pointer is this same draw - its
+				// author added it because pad players had no cursor otherwise - so suppressing
+				// it on a gamepad would take away the only pointer on screen.
+				return config.enabled && config.useHardwareCursor &&
+					   !g_gamepadMode.load(std::memory_order_relaxed) &&
+					   g_active.load(std::memory_order_relaxed);
+			}
+		}
+
+		bool GridInventoryMenuOpen()
+		{
+			auto* ui = RE::UI::GetSingleton();
+			if (!ui) {
+				return false;
+			}
+			// Constructed once. IsMenuOpen takes a BSFixedString, and building one per call
+			// would hash this literal on every sync tick.
+			static const RE::BSFixedString name{ "GridInventoryMenu" };
+			return ui->IsMenuOpen(name);
+		}
+
+		// The fallback for a Grid Inventory we could not patch, and the reason that mod needs
+		// something the other two do not.
+		//
+		// Grid Inventory is updated often, and its signature is a guard inside an inlined
+		// function - the kind of thing that moves on any build. When it fails to resolve we
+		// cannot take their pointer away, so we give up ours instead for as long as their menu
+		// is on screen: one frame-locked pointer drawn by them beats two.
+		//
+		// Deliberately not gated on g_active, unlike the suppression policy it backs up. This
+		// is read by Activate() to decide whether to draw at all, so it has to be settled
+		// before the activation it applies to rather than derived from it.
+		bool ShouldYieldPointer()
+		{
+			const auto& config = Config::Get();
+			if (!config.enabled || !config.useHardwareCursor ||
+				config.suppressGridInventoryCursor == CursorSuppression::kOff ||
+				g_gamepadMode.load(std::memory_order_relaxed)) {
+				return false;
+			}
+
+			// Only when the module is actually loaded and the signature actually failed. A
+			// resolved stub does the real thing, and an absent Grid Inventory must not cost
+			// anybody their hardware cursor.
+			if (!g_gridInventoryStub.resolved || g_gridInventoryStub.site ||
+				!::GetModuleHandleW(g_gridInventoryStub.module)) {
+				return false;
+			}
+
+			return GridInventoryMenuOpen();
+		}
+
+		void UpdatePointerYield()
+		{
+			const bool yield = ShouldYieldPointer();
+			if (g_yieldPointer.exchange(yield, std::memory_order_relaxed) == yield) {
+				return;
+			}
+
+			if (yield) {
+				SKSE::log::info(
+					"Grid Inventory could not be patched, so the hardware cursor is standing "
+					"down while its menu is open - expect one pointer, drawn by Grid Inventory "
+					"at frame rate.");
+			} else {
+				SKSE::log::info("Grid Inventory's menu closed; taking the hardware cursor back.");
+			}
+		}
+
 		void ApplyPrismaCursorPolicy()
 		{
 			SetCursorStubSuppressed(g_prismaStub, WantPrismaCursorSuppressed());
@@ -919,13 +1209,19 @@ namespace CursorUnbound
 			SetCursorStubSuppressed(g_partySheetStub, WantPartySheetCursorSuppressed());
 		}
 
-		// Called wherever either policy's inputs can have changed. Both are cheap and
-		// idempotent - SetCursorStubSuppressed early-outs unless the desired state actually
-		// differs from the applied one - so this is safe on the sync timer.
+		void ApplyGridInventoryCursorPolicy()
+		{
+			SetCursorStubSuppressed(g_gridInventoryStub, WantGridInventoryCursorSuppressed());
+		}
+
+		// Called wherever any policy's inputs can have changed. All are cheap and idempotent -
+		// SetCursorStubSuppressed early-outs unless the desired state actually differs from the
+		// applied one - so this is safe on the sync timer.
 		void ApplyCursorSuppressionPolicies()
 		{
 			ApplyPrismaCursorPolicy();
 			ApplyPartySheetCursorPolicy();
+			ApplyGridInventoryCursorPolicy();
 		}
 
 		// ---------------------------------------------------------------------------
@@ -1765,7 +2061,8 @@ namespace CursorUnbound
 		{
 			if (!g_active.load(std::memory_order_relaxed) ||
 				!Config::Get().useHardwareCursor ||
-				g_gamepadMode.load(std::memory_order_relaxed)) {
+				g_gamepadMode.load(std::memory_order_relaxed) ||
+				g_yieldPointer.load(std::memory_order_relaxed)) {
 				return;
 			}
 
@@ -1794,9 +2091,11 @@ namespace CursorUnbound
 			}
 
 			// Only while the cursor is not ours to show. Gamepad mode counts as not ours: the
-			// game draws its own pointer there and wants the OS one gone.
+			// game draws its own pointer there and wants the OS one gone. So does yielding to a
+			// mod drawing its own, which is the same bargain struck with a different party.
 			if (g_active.load(std::memory_order_relaxed) &&
-				!g_gamepadMode.load(std::memory_order_relaxed)) {
+				!g_gamepadMode.load(std::memory_order_relaxed) &&
+				!g_yieldPointer.load(std::memory_order_relaxed)) {
 				return;
 			}
 
@@ -1836,6 +2135,11 @@ namespace CursorUnbound
 			// captured while inactive - which is the state to inspect if a menu ever ends up
 			// with no cursor again.
 			LogDiagnosticSummary();
+
+			// Before the activation decision, not after it: Activate() reads this to decide
+			// whether to draw a pointer at all, so a stale value would show one for a tick on
+			// the frame the grid inventory opens.
+			UpdatePointerYield();
 
 			const bool shouldBeActive = MenusWantCursor();
 			const bool isActive = g_active.load(std::memory_order_relaxed);
@@ -1885,7 +2189,8 @@ namespace CursorUnbound
 				// is what stops the window class cursor being applied over ours a moment later.
 				SyncActiveState();
 				if (g_active.load(std::memory_order_relaxed) && Config::Get().useHardwareCursor &&
-					!g_gamepadMode.load(std::memory_order_relaxed) && LOWORD(a_lparam) == HTCLIENT) {
+					!g_gamepadMode.load(std::memory_order_relaxed) &&
+					!g_yieldPointer.load(std::memory_order_relaxed) && LOWORD(a_lparam) == HTCLIENT) {
 					HCURSOR cursor = g_customCursor ? g_customCursor : g_fallbackCursor;
 					if (!cursor) {
 						// Never pass null here - that would hide the pointer entirely.
@@ -2071,12 +2376,20 @@ namespace CursorUnbound
 				SyncOsCursorToGame();
 			}
 
+			const bool yielded = g_yieldPointer.load(std::memory_order_relaxed);
+
 			if (config.useHardwareCursor && !g_gamepadMode.load(std::memory_order_relaxed)) {
 				if (config.hideGameCursor) {
 					SetScaleformCursorVisible(false, false);
 				}
-				ForceCursorShown();
-				::SetCursor(g_customCursor ? g_customCursor : g_fallbackCursor);
+				// The Scaleform cursor above stays down even when yielding - the mod we are
+				// yielding to hides it itself, and putting it back here would be a third pointer
+				// on screen. Only the showing of ours is skipped; AssertCursorHidden takes the
+				// OS cursor back down from here.
+				if (!yielded) {
+					ForceCursorShown();
+					::SetCursor(g_customCursor ? g_customCursor : g_fallbackCursor);
+				}
 			}
 
 			ApplyClip(config.clipToWindow);
@@ -2089,10 +2402,11 @@ namespace CursorUnbound
 			g_stats.ResetPerActivation();
 
 			SKSE::log::info(
-				"Activated (hardwareCursor={}, customArt={}, showCursorCount={}).",
+				"Activated (hardwareCursor={}, customArt={}, showCursorCount={}, yielded={}).",
 				config.useHardwareCursor,
 				g_customCursor != nullptr,
-				g_lastCursorCount);
+				g_lastCursorCount,
+				yielded);
 		}
 
 		void Deactivate()
@@ -2341,6 +2655,7 @@ namespace CursorUnbound
 		// so a failure to find the game window does not also cost us this.
 		ResolveCursorStub(g_prismaStub);
 		ResolveCursorStub(g_partySheetStub);
+		ResolveCursorStub(g_gridInventoryStub);
 		ApplyCursorSuppressionPolicies();
 
 		g_runtimeReady.store(true);
@@ -2358,6 +2673,7 @@ namespace CursorUnbound
 		// plugin does not leave another mod permanently stubbed.
 		SetCursorStubSuppressed(g_prismaStub, false);
 		SetCursorStubSuppressed(g_partySheetStub, false);
+		SetCursorStubSuppressed(g_gridInventoryStub, false);
 
 		if (g_window && ::IsWindow(g_window)) {
 			::KillTimer(g_window, kSyncTimerId);

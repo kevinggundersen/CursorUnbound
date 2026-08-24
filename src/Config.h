@@ -94,6 +94,16 @@ namespace CursorUnbound
 		// you the suppression setting above without the activation, which is only useful for
 		// working out which half of the pair is misbehaving.
 		bool              trackPartySheetPanels = true;
+		// Grid Inventory replaces the inventory with a Dear ImGui grid, hides the Scaleform
+		// cursor itself and draws its own arrow onto the ImGui foreground list - frame-locked,
+		// so alongside the hardware cursor it reads as a second pointer trailing the first.
+		//
+		// kAuto is gated on us being active, like Party Sheet: the grid menu opens the Cursor
+		// Menu itself, so we come up a frame or two behind it and those frames should keep
+		// their pointer. Suppression here is also the one that cannot be done with a RET -
+		// their draw is inlined - so if the signature goes stale we stand our own cursor down
+		// while the grid is open instead, rather than leaving two on screen.
+		CursorSuppression suppressGridInventoryCursor = CursorSuppression::kAuto;
 		CoordinateSpace coordinateSpace = CoordinateSpace::kAuto;
 		// Manual escape hatch. When > 0 these override whatever the coordinate space
 		// resolution would have picked.
