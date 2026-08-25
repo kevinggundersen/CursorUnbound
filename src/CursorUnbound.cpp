@@ -98,6 +98,12 @@ namespace CursorUnbound
 		float         g_observedMaxY = std::numeric_limits<float>::lowest();
 		std::uint64_t g_lastRangeLogTick = 0;
 
+		// Throttle for ReassertScaleformHidden. At namespace scope rather than a
+		// function-local static so Activate can zero it: otherwise a mouse move shortly
+		// before a menu opened would hold the first re-assert off for the rest of that
+		// 250ms, which is the whole window the re-assert exists to cover.
+		std::uint64_t g_lastReassertTick = 0;
+
 		// ---------------------------------------------------------------------------
 		// Window helpers
 		// ---------------------------------------------------------------------------
@@ -1775,22 +1781,31 @@ namespace CursorUnbound
 				menuCursor ? menuCursor->cursorSensitivity : -1.0f);
 		}
 
-		// The game re-shows its cursor on some menu transitions, so re-assert periodically
-		// rather than only on menu open. Throttled because this runs off mouse movement.
+		// Re-applies the game-cursor hide, periodically rather than only on menu open.
+		//
+		// Two things make the one-shot hide in Activate unreliable. The game re-shows its
+		// cursor on some menu transitions; and Activate runs off the Cursor Menu's open hint,
+		// which by design fires a frame or two before the menu reaches the stack - so the menu
+		// may not be in the map yet, may still be the outgoing instance, or may not have
+		// loaded its uiMovie. All three miss the movie that actually draws, and
+		// SetScaleformCursorVisible returns quietly when they do.
+		//
+		// Guards on g_active itself rather than trusting the caller. Yielding is deliberately
+		// not a guard: the mod we yield to hides this cursor too, so keeping it down is right.
 		void ReassertScaleformHidden()
 		{
 			const auto& config = Config::Get();
-			if (!config.useHardwareCursor || !config.hideGameCursor ||
+			if (!g_active.load(std::memory_order_relaxed) ||
+				!config.useHardwareCursor || !config.hideGameCursor ||
 				g_gamepadMode.load(std::memory_order_relaxed)) {
 				return;
 			}
 
-			static std::uint64_t lastTick = 0;
-			const auto           now = ::GetTickCount64();
-			if (now - lastTick < 250) {
+			const auto now = ::GetTickCount64();
+			if (now - g_lastReassertTick < 250) {
 				return;
 			}
-			lastTick = now;
+			g_lastReassertTick = now;
 
 			// Report the first couple of attempts in full, then let the periodic summary
 			// carry the story rather than flooding the log.
@@ -2168,6 +2183,12 @@ namespace CursorUnbound
 					if (!g_window || ::GetForegroundWindow() == g_window) {
 						AssertCursorState();
 						AssertCursorHidden();
+						// The game cursor needs the same treatment as the OS one, and for the
+						// same reason: the hide on menu open can miss the movie, and until this
+						// ran here the only thing that ever retried was the mouse-move hook. A
+						// menu opened with the mouse held still therefore kept the game's
+						// pointer on screen until the player moved it.
+						ReassertScaleformHidden();
 					}
 					return 0;
 				}
@@ -2394,6 +2415,11 @@ namespace CursorUnbound
 
 			ApplyClip(config.clipToWindow);
 
+			// The hide above may have found no menu, the outgoing one, or no uiMovie yet.
+			// Zeroing the throttle lets the next sync tick retry at once instead of waiting
+			// out a window that a mouse move just before the menu opened may have half spent.
+			g_lastReassertTick = 0;
+
 			++g_stats.activations;
 
 			// Refill the diagnostic budget and zero the per-activation counters, so the log
@@ -2538,9 +2564,13 @@ namespace CursorUnbound
 
 				// Deliberately outside the positioning branch. Some menus re-show the game
 				// cursor every frame, and the one-shot hides on menu open lose that race, so
-				// this per-move re-assert is the only thing holding it down. Hanging it off
+				// the hide has to be re-asserted rather than trusted. Hanging it off
 				// AbsolutePositioning meant the documented AbsolutePositioning = false fallback
 				// silently gave up the suppression too, and drew both cursors.
+				//
+				// The sync timer re-asserts as well, which is what covers a menu opened while
+				// the mouse is still. This call is still worth keeping: it catches the re-show
+				// on the frame the player moves, without waiting for the next tick.
 				if (active) {
 					ReassertScaleformHidden();
 				}
