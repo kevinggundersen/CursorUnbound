@@ -104,6 +104,15 @@ namespace CursorUnbound
 		// 250ms, which is the whole window the re-assert exists to cover.
 		std::uint64_t g_lastReassertTick = 0;
 
+		// Throttle for ReassertScaleformShown, the gamepad-mode mirror of the above.
+		std::uint64_t g_lastReshowTick = 0;
+
+		// True while a hide of ours has actually reached the cursor movie and not been undone.
+		// Written only by SetScaleformCursorVisible when it gets as far as the movie, and by
+		// Deactivate, which drops every piece of per-instance state. This is what lets the
+		// gamepad-mode re-show undo exactly our own hides and nothing the game did itself.
+		std::atomic<bool> g_scaleformHiddenByUs{ false };
+
 		// ---------------------------------------------------------------------------
 		// Window helpers
 		// ---------------------------------------------------------------------------
@@ -1390,14 +1399,17 @@ namespace CursorUnbound
 				okPrePass);
 		}
 
-		void SetScaleformCursorVisible(bool a_visible, bool a_log = true)
+		// Returns whether the call reached the cursor movie at all. A false return means
+		// nothing was applied, and callers that need the state to land - the periodic
+		// re-asserts in both directions - retry on it.
+		bool SetScaleformCursorVisible(bool a_visible, bool a_log = true)
 		{
 			auto* ui = RE::UI::GetSingleton();
 			if (!ui) {
 				if (a_log) {
 					SKSE::log::warn("Cannot reach the UI singleton to hide the game cursor.");
 				}
-				return;
+				return false;
 			}
 
 			auto menu = ui->GetMenu(RE::CursorMenu::MENU_NAME);
@@ -1405,7 +1417,7 @@ namespace CursorUnbound
 				if (a_log) {
 					SKSE::log::warn("Cursor Menu is not in the menu map; cannot hide the game cursor.");
 				}
-				return;
+				return false;
 			}
 			if (!menu->uiMovie) {
 				// The menu object can exist before its movie is loaded, which is why this is
@@ -1413,7 +1425,7 @@ namespace CursorUnbound
 				if (a_log) {
 					SKSE::log::warn("Cursor Menu has no uiMovie yet; will retry.");
 				}
-				return;
+				return false;
 			}
 
 			auto*      movie = menu->uiMovie.get();
@@ -1471,8 +1483,10 @@ namespace CursorUnbound
 				}
 			}
 
+			g_scaleformHiddenByUs.store(!a_visible, std::memory_order_relaxed);
+
 			if (!a_log) {
-				return;
+				return true;
 			}
 
 			// -1 means "not attempted" for the two SetVariable results.
@@ -1486,6 +1500,7 @@ namespace CursorUnbound
 				movie->GetVisible(),
 				rootVisibleResult,
 				rootAlphaResult);
+			return true;
 		}
 
 		// Whoever currently sits at the head of the window's procedure chain.
@@ -1711,7 +1726,8 @@ namespace CursorUnbound
 			// else the rest of the log says.
 			SKSE::log::info(
 				"[input] since activation: ProcessMouseMove entered={} engaged={} thumbstick={} "
-				"| WM_TIMER={} WM_MOUSEMOVE={} WM_SETCURSOR={} answered={} | cursorIsOurs={}",
+				"| WM_TIMER={} WM_MOUSEMOVE={} WM_SETCURSOR={} answered={} | gamepad={} "
+				"scaleformHiddenByUs={} cursorIsOurs={}",
 				g_stats.mouseMoveCalls,
 				g_stats.mouseMoveEngaged,
 				g_stats.thumbstickCalls,
@@ -1719,6 +1735,8 @@ namespace CursorUnbound
 				g_stats.wmMouseMove,
 				g_stats.wmSetCursor,
 				g_stats.wmSetCursorAnswered,
+				g_gamepadMode.load(std::memory_order_relaxed),
+				g_scaleformHiddenByUs.load(std::memory_order_relaxed),
 				CursorIsOurs());
 
 			// Which window we are attached to, which one the input is actually going to, and
@@ -1817,6 +1835,55 @@ namespace CursorUnbound
 
 			SetScaleformCursorVisible(false, logThis);
 			LogDiagnosticSummary();
+		}
+
+		// The mirror of ReassertScaleformHidden, for as long as a gamepad owns the cursor.
+		//
+		// In gamepad mode the game's own pointer is the only one on screen - the OS cursor is
+		// already down - so a hide of ours that is still in effect leaves the player with no
+		// cursor at all. That used to be exactly what happened on the world map: gamepad mode
+		// is sticky until the mouse moves, and a menu opening or closing over the map (the
+		// fast-travel prompt, the map opening under an already-open Cursor Menu) re-hid the
+		// movie with nothing to ever show it again. EnterGamepadMode undoes the hide once, on
+		// the transition, but that is a single attempt against a menu that may not have its
+		// movie yet, and it cannot see a hide that lands afterwards.
+		//
+		// Runs from the sync timer. Only ever undoes what this plugin applied: the tracked
+		// hide, the suppressed-movie reference and the saved viewport are all ours.
+		void ReassertScaleformShown()
+		{
+			if (!g_gamepadMode.load(std::memory_order_relaxed)) {
+				return;
+			}
+
+			const bool hidden = g_scaleformHiddenByUs.load(std::memory_order_relaxed);
+			const bool suppressed = g_suppressedMovie.load(std::memory_order_acquire) != nullptr;
+			if (!hidden && !suppressed && !g_viewportSaved) {
+				return;
+			}
+
+			const auto now = ::GetTickCount64();
+			if (now - g_lastReshowTick < 250) {
+				return;
+			}
+			g_lastReshowTick = now;
+
+			if (SetScaleformCursorVisible(true, false)) {
+				SKSE::log::info(
+					"Game cursor was hidden while a gamepad owns it; shown again.");
+				return;
+			}
+
+			// The call found no Cursor Menu, or one without a movie yet. Either way the
+			// movie we are still holding suppressed belongs to an instance that is gone or
+			// going, and so does the saved viewport - the same reasoning Deactivate applies.
+			// The tracked hide is left set so the next tick tries the new movie again.
+			if (suppressed || g_viewportSaved) {
+				ClearSuppressedMovie();
+				g_viewportSaved = false;
+				SKSE::log::info(
+					"Dropped a stale cursor-movie suppression while a gamepad owns the cursor.");
+			}
 		}
 
 		// ---------------------------------------------------------------------------
@@ -2189,6 +2256,7 @@ namespace CursorUnbound
 						// menu opened with the mouse held still therefore kept the game's
 						// pointer on screen until the player moved it.
 						ReassertScaleformHidden();
+						ReassertScaleformShown();
 					}
 					return 0;
 				}
@@ -2411,6 +2479,11 @@ namespace CursorUnbound
 					ForceCursorShown();
 					::SetCursor(g_customCursor ? g_customCursor : g_fallbackCursor);
 				}
+			} else if (config.useHardwareCursor) {
+				// Gamepad mode carried over from an earlier menu. The game's pointer is the
+				// one that has to be visible here, so make sure no hide of ours is still in
+				// effect; the timer retries if the movie is not loaded yet.
+				SetScaleformCursorVisible(true, false);
 			}
 
 			ApplyClip(config.clipToWindow);
@@ -2452,6 +2525,7 @@ namespace CursorUnbound
 				// allocation at the same address would silently go invisible.
 				g_viewportSaved = false;
 				ClearSuppressedMovie();
+				g_scaleformHiddenByUs.store(false, std::memory_order_relaxed);
 			}
 
 			SKSE::log::info(
@@ -2810,7 +2884,13 @@ namespace CursorUnbound
 
 		// Menus stacking on top of the cursor menu can re-show the Scaleform pointer, so
 		// re-assert our state whenever anything else opens or closes.
+		//
+		// Not while a gamepad owns the cursor. This was the one hide not gated on gamepad
+		// mode, and with the OS cursor already hidden there it left the world map with no
+		// pointer at all after any menu event - the fast-travel prompt being the reliable
+		// one. ReassertScaleformShown catches anything that still slips through.
 		if (g_active.load(std::memory_order_relaxed) &&
+			!g_gamepadMode.load(std::memory_order_relaxed) &&
 			Config::Get().useHardwareCursor &&
 			Config::Get().hideGameCursor) {
 			SetScaleformCursorVisible(false, false);
