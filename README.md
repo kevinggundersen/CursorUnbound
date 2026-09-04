@@ -34,16 +34,23 @@ glide — the thing that actually reads as sluggish — is not.
 ## Requirements
 
 - Skyrim Special Edition or Anniversary Edition (developed against runtime **1.6.1170**;
-  the DLL is address-library based and covers SE and AE generally, including **1.7.99**)
-- SKSE64 — 2.3.0 or later on 1.7.99
+  the DLL is address-library based and covers SE and AE generally, including **1.7.99**
+  and **1.7.104**)
+- SKSE64 — 2.3.0 or later on 1.7.99, 2.3.1 or later on 1.7.104
 - Address Library for SKSE Plugins — on 1.7.99 you need a build that contains
-  `versionlib-1-7-99-0.bin`
+  `versionlib-1-7-99-0.bin`; on 1.7.104, one that contains `versionlib-1-7-104-0.bin`
+  (Address Library 13.0 or later)
 
-**On 1.7.99** the game inserted two new virtuals into `MenuEventHandler`, shifting the two
-slots this plugin hooks down by two. The plugin detects the runtime and picks the right
-slots; the log line `Hooked CursorMenu::ProcessMouseMove (vfunc 0x6)` reports which pair it
-resolved to (`0x6`/`0x5` on 1.7.99, `0x4`/`0x3` below it). If the cursor does nothing on a
-future runtime, that line is the first thing to check.
+**On 1.7.99 and later** the game inserted two new virtuals into `MenuEventHandler`,
+shifting the two slots this plugin hooks down by two. The plugin detects the runtime and
+picks the right slots; the log line `Hooked CursorMenu::ProcessMouseMove (vfunc 0x6)`
+reports which pair it resolved to (`0x6`/`0x5` on 1.7.99 and 1.7.104, `0x4`/`0x3` below
+it). If the cursor does nothing on a future runtime, that line is the first thing to check.
+
+**1.7.104 note.** SKSE 2.3.1 added a plugin-header flag declaring compatibility with the
+address-library encoding used since 1.7.99. Builds from 1.0.9 onward declare it (via
+CommonLibSSE-NG 7.2.0); a 1.0.8 DLL still loads on 2.3.1 only because SKSE waives the
+check for DLLs built after May 2025.
 
 **Skyrim VR is not supported.** In VR builds CommonLibSSE strips `MenuEventHandler` off
 `CursorMenu`, which removes the virtual this plugin hooks. VR would need a different

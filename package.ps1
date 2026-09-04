@@ -67,8 +67,8 @@ game renders. This hides that sprite, hands drawing to the Windows hardware curs
 into the game as an absolute coordinate instead of an fps-scaled delta.
 
 REQUIREMENTS
-  - Skyrim SE or AE (built against 1.6.1170; address-library based)
-  - SKSE64
+  - Skyrim SE or AE (built against 1.6.1170; address-library based, covers 1.7.99 and 1.7.104)
+  - SKSE64 (2.3.1 or later on 1.7.104)
   - Address Library for SKSE Plugins
   - Skyrim VR is NOT supported
 

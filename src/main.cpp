@@ -133,15 +133,39 @@ namespace
 	}
 }
 
-SKSEPluginInfo(
-	.Version = REL::Version{
+// Declared through PluginVersionData rather than the SKSEPluginInfo macro. The macro emits
+// a PluginDeclaration whose StructCompatibility field is what lands in SKSE's
+// versionIndependenceEx word, and it only ever writes the NoStructUse bit there. SKSE
+// 2.3.1 (runtime 1.7.104) also expects kVersionIndependentEx_AddressLibraryV5 in that word
+// from address-library plugins; without it a DLL loads only because SKSE waives the check
+// for binaries built after May 2025. PluginVersionData carries the V5 bit by default as
+// of CommonLibSSE-NG 6.7.0, and it zero-terminates compatibleVersions, which the macro
+// fills with 1.0.0.0 entries.
+SKSEPluginVersion = []() {
+	SKSE::PluginVersionData v;
+	v.PluginVersion(REL::Version{
 		CURSOR_UNBOUND_VERSION_MAJOR,
 		CURSOR_UNBOUND_VERSION_MINOR,
 		CURSOR_UNBOUND_VERSION_PATCH,
-		0 },
-	.Name = "CursorUnbound"sv,
-	.Author = "Datsferg"sv,
-	.RuntimeCompatibility = SKSE::VersionIndependence::AddressLibrary)
+		0 });
+	v.PluginName("CursorUnbound"sv);
+	v.AuthorName("Datsferg"sv);
+	v.UsesAddressLibrary();
+	// What the macro's StructCompatibility::Independent default meant. Required on
+	// 1.6.629+ because UsesUpdatedStructs is not set: CommonLibSSE-NG resolves both
+	// struct layouts in one build, so the plugin is not tied to either.
+	v.UsesNoStructs();
+	return v;
+}();
+
+// The macro defined this as well. Pre-AE SKSE (1.5.97) still discovers plugins through it.
+SKSE_EXPORT bool SKSEPlugin_Query(SKSE::QueryInterface*, SKSE::PluginInfo* a_info)
+{
+	a_info->infoVersion = SKSE::PluginInfo::kVersion;
+	a_info->name = SKSEPlugin_Version.GetPluginName().data();
+	a_info->version = SKSEPlugin_Version.pluginVersion;
+	return true;
+}
 
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
