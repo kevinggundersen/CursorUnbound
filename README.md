@@ -118,6 +118,8 @@ See the comments in `CursorUnbound.ini`. The settings most worth knowing:
 | `HideMethod` | Which mechanism suppresses the game's cursor sprite. `render` is the default and the only one that reliably works; `rootalpha`, `viewport` and `all` are fallbacks. |
 | `AbsolutePositioning` | The speed-scaling fix, independent of the hardware cursor swap. |
 | `NeutralizeGameDelta` | Stops the game integrating movement on top of the absolute position. Disabling it reintroduces overshoot jitter. |
+| `ClipToWindow` | Confines the pointer to the game window while a menu is open. On menu close, whatever clip was in effect before is restored rather than cleared. |
+| `ClipDuringGameplay` | Also confines the hidden pointer during gameplay, for setups without SSE Display Tweaks' `LockCursor`. Off by default. |
 | `CoordinateSpace` | Leave on `auto` unless the cursor is visually offset from where clicks land. |
 | `LogCursorRange` | Diagnostic. Logs the coordinate range the game itself produces. |
 | `BlockGameCursorHide` | Stops the game re-hiding the OS cursor. Disable if it fights another mod. |
@@ -249,6 +251,14 @@ The log stops after `Patched USER32!ShowCursor in the game import table.` and ne
 `Patched USER32!ShowCursor in N module(s)`. On 1.0.2 or 1.0.3, `HookAllModules = false`
 avoids it. On 1.0.4 the walk is bounds-checked and skips any module it cannot read;
 `LogLevel = debug` then names each module as it is swept, which identifies the offender.
+
+**The mouse wheel scrolls a window on another monitor while you play.** The hidden pointer
+has drifted off the game window. Up to 1.0.9 this plugin caused it whenever SSE Display Tweaks'
+`LockCursor` was in use: Windows keeps a single clip rectangle per process, Display Tweaks
+only re-applies its lock on focus changes, and this plugin cleared the rectangle on every menu
+close, so the first menu you closed cancelled the lock until the next alt-tab. From 1.0.10 the
+clip in effect when a menu opened is put back when it closes. If you do not use Display Tweaks,
+`ClipDuringGameplay = true` confines the pointer for the whole session instead.
 
 **Conflicts.** Mods that draw their own pointer (ImGui-based overlays) or manage cursor
 visibility can fight this. Skyrim Souls RE changes which menus are open and is worth

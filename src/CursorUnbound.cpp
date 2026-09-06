@@ -153,13 +153,58 @@ namespace CursorUnbound
 			return g_window;
 		}
 
-		void ApplyClip(bool a_clip)
-		{
-			if (!a_clip) {
-				::ClipCursor(nullptr);
-				return;
-			}
+		// ---------------------------------------------------------------------------
+		// Cursor clipping
+		//
+		// ClipCursor is a single process-wide rectangle, and we are not the only ones
+		// setting it: SSEDisplayTweaks' LockCursor confines the hidden pointer to the window
+		// during gameplay, and it only ever re-applies that on focus and activation
+		// messages. A ClipCursor(nullptr) from us on menu close therefore did not just drop
+		// our clip, it silently cancelled theirs for the rest of the session - the pointer
+		// then drifted onto the next monitor during gameplay and the wheel scrolled whatever
+		// was under it. So we never release a clip we did not set, and on menu close we put
+		// back whichever one was in effect when the menu opened.
+		// ---------------------------------------------------------------------------
 
+		RECT g_foreignClip{};             // clip in effect when we activated, if any
+		bool g_foreignClipValid = false;
+
+		bool GameWindowIsForeground()
+		{
+			HWND hwnd = ResolveGameWindow();
+			return hwnd && ::GetForegroundWindow() == hwnd;
+		}
+
+		// Whether we want a clip in the current state: ours while a menu is open, and the
+		// gameplay one in between if configured.
+		bool WantClip()
+		{
+			const auto& config = Config::Get();
+			return g_active.load(std::memory_order_relaxed) ? config.clipToWindow : config.clipDuringGameplay;
+		}
+
+		// GetClipCursor reports the whole virtual desktop when nothing is clipping, and that
+		// is not a clip worth remembering.
+		bool ClipCoversDesktop(const RECT& a_rect)
+		{
+			const int x = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
+			const int y = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+			const int w = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+			const int h = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+			return a_rect.left <= x && a_rect.top <= y && a_rect.right >= x + w && a_rect.bottom >= y + h;
+		}
+
+		void RememberForeignClip()
+		{
+			RECT rect{};
+			g_foreignClipValid = ::GetClipCursor(&rect) && !ClipCoversDesktop(rect);
+			if (g_foreignClipValid) {
+				g_foreignClip = rect;
+			}
+		}
+
+		void ApplyClip()
+		{
 			HWND hwnd = ResolveGameWindow();
 			if (!hwnd) {
 				return;
@@ -178,6 +223,43 @@ namespace CursorUnbound
 
 			RECT screenRect{ topLeft.x, topLeft.y, bottomRight.x, bottomRight.y };
 			::ClipCursor(&screenRect);
+		}
+
+		// Apply the clip the current state calls for, if any. Touches nothing otherwise, so
+		// a clip set by someone else survives.
+		void AssertClip()
+		{
+			if (WantClip()) {
+				ApplyClip();
+			}
+		}
+
+		// Menu close. Hand the clip back to whoever had it, keep it for gameplay if
+		// configured, or release it - and only ever release one we set.
+		void ReleaseMenuClip()
+		{
+			const auto& config = Config::Get();
+			const bool  remembered = g_foreignClipValid;
+			g_foreignClipValid = false;
+
+			if (!config.clipToWindow) {
+				return;
+			}
+
+			// Restoring anything while another window is in front would confine the pointer
+			// in someone else's application.
+			if (!GameWindowIsForeground()) {
+				::ClipCursor(nullptr);
+				return;
+			}
+
+			if (config.clipDuringGameplay) {
+				ApplyClip();
+			} else if (remembered) {
+				::ClipCursor(&g_foreignClip);
+			} else {
+				::ClipCursor(nullptr);
+			}
 		}
 
 		// ---------------------------------------------------------------------------
@@ -2394,11 +2476,11 @@ namespace CursorUnbound
 						// to the window is exactly when a menu we never saw open has to be picked
 						// up.
 						SyncActiveState();
+						AssertClip();
 						if (g_active.load(std::memory_order_relaxed)) {
-							ApplyClip(Config::Get().clipToWindow);
 							AssertCursorState();
 						}
-					} else if (g_active.load(std::memory_order_relaxed)) {
+					} else if (WantClip()) {
 						::ClipCursor(nullptr);
 					}
 				}
@@ -2406,9 +2488,7 @@ namespace CursorUnbound
 
 			case WM_SIZE:
 			case WM_MOVE:
-				if (g_active.load(std::memory_order_relaxed)) {
-					ApplyClip(Config::Get().clipToWindow);
-				}
+				AssertClip();
 				break;
 
 			case WM_DESTROY:
@@ -2465,6 +2545,12 @@ namespace CursorUnbound
 				static_cast<void*>(hwnd),
 				g_windowIsUnicode,
 				timerOk);
+
+			// The window is usually already in front by the time we subclass it, so no
+			// WM_ACTIVATE is coming to put the gameplay clip on. Do it here.
+			if (Config::Get().clipDuringGameplay && ::GetForegroundWindow() == hwnd) {
+				ApplyClip();
+			}
 			if (!timerOk) {
 				SKSE::log::warn(
 					"Could not start the sync timer (error {}); menus will only pick the cursor up "
@@ -2577,7 +2663,12 @@ namespace CursorUnbound
 				SetScaleformCursorVisible(true, false);
 			}
 
-			ApplyClip(config.clipToWindow);
+			// Remembered before ours goes on, so the menu close can hand it back. Pointless
+			// when we keep clipping through gameplay anyway.
+			if (config.clipToWindow && !config.clipDuringGameplay) {
+				RememberForeignClip();
+			}
+			AssertClip();
 
 			// The hide above may have found no menu, the outgoing one, or no uiMovie yet.
 			// Zeroing the throttle lets the next sync tick retry at once instead of waiting
@@ -2605,7 +2696,7 @@ namespace CursorUnbound
 				return;
 			}
 
-			::ClipCursor(nullptr);
+			ReleaseMenuClip();
 
 			if (Config::Get().useHardwareCursor) {
 				SetScaleformCursorVisible(true, false);

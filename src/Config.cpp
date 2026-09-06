@@ -173,6 +173,8 @@ namespace CursorUnbound
 					neutralizeGameDelta = ParseBool(value, neutralizeGameDelta);
 				} else if (key == "cliptowindow") {
 					clipToWindow = ParseBool(value, clipToWindow);
+				} else if (key == "clipduringgameplay") {
+					clipDuringGameplay = ParseBool(value, clipDuringGameplay);
 				} else if (key == "blockgamecursorhide") {
 					blockGameCursorHide = ParseBool(value, blockGameCursorHide);
 				} else if (key == "enforcehiddenwheninactive") {

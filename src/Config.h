@@ -65,6 +65,13 @@ namespace CursorUnbound
 		// restored immediately afterwards so other menu handlers still see it.
 		bool            neutralizeGameDelta = true;
 		bool            clipToWindow = true;
+		// Keep the clip on during gameplay as well, not just while a menu is open. The game
+		// never confines the hidden pointer itself, so in borderless or windowed mode it
+		// drifts onto a neighbouring monitor and the wheel starts scrolling whatever is
+		// there. SSEDisplayTweaks' LockCursor does the same job; this is for people without
+		// it. Off by default because it changes gameplay behaviour for anyone who plays in a
+		// small window and wants to reach the rest of the desktop.
+		bool            clipDuringGameplay = false;
 		bool            blockGameCursorHide = true;
 		// Keep re-hiding the OS cursor while no menu wants it. The display counter is a
 		// process-wide resource that the game, SSEDisplayTweaks and other SKSE plugins all
