@@ -104,6 +104,16 @@ namespace CursorUnbound
 		// their draw is inlined - so if the signature goes stale we stand our own cursor down
 		// while the grid is open instead, rather than leaving two on screen.
 		CursorSuppression suppressGridInventoryCursor = CursorSuppression::kAuto;
+		// Meridian UI is a Chromium framework that draws its own pointer at present time,
+		// after its browser layers, from MenuCursor::cursorPosX/Y - the same shape as Prisma's:
+		// it inherits our absolute position and is still frame-locked, so alongside the
+		// hardware cursor it reads as a second pointer trailing the first.
+		//
+		// kAuto follows Prisma's rule rather than Party Sheet's: Meridian only draws its
+		// pointer while one of its browsers holds focus, and holding focus is what opens its
+		// focus menu - which carries kUsesCursor and so brings us up. There is no moment it
+		// wants a pointer that we are not covering.
+		CursorSuppression suppressMeridianCursor = CursorSuppression::kAuto;
 		CoordinateSpace coordinateSpace = CoordinateSpace::kAuto;
 		// Manual escape hatch. When > 0 these override whatever the coordinate space
 		// resolution would have picked.

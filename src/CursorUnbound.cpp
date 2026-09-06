@@ -774,6 +774,62 @@ namespace CursorUnbound
 			0x0F, 0x87,   -1,   -1,   -1,   -1,
 		};
 
+		// Meridian UI's CursorRenderer::Draw prologue, from MeridianUI.dll:
+		//
+		//   48 89 5C 24 18           mov  [rsp+0x18], rbx
+		//   55                       push rbp
+		//   56                       push rsi
+		//   57                       push rdi
+		//   41 54                    push r12
+		//   41 55                    push r13
+		//   41 56                    push r14
+		//   41 57                    push r15
+		//   48 83 EC 70              sub  rsp, 0x70
+		//   48 8B 05 ?? ?? ?? ??     mov  rax, [rip+__security_cookie]
+		//   48 33 C4                 xor  rax, rsp
+		//   48 89 44 24 60           mov  [rsp+0x60], rax
+		//   4C 8B EA                 mov  r13, rdx      ; RenderData&
+		//   4C 8B F9                 mov  r15, rcx      ; this
+		//   48 8B 29                 mov  rbp, [rcx]    ; m_current, the HCURSOR to draw
+		//
+		// Meridian UI is a Chromium (CEF) framework, and its pointer has the same shape as
+		// Prisma's. Chromium reports a Windows cursor handle, Meridian rasterises it into a
+		// texture, and Draw blits that texture with a sprite batch at MenuCursor::cursorPosX/Y
+		// after its browser layers, inside the game's present hook - so it inherits our absolute
+		// position and is still frame-locked. It only draws while one of its browsers holds
+		// focus, which is also when its focus menu (kUsesCursor) has brought us up.
+		//
+		// Same signature shape and the same reasoning as Prisma's: the cookie displacement is
+		// wildcarded, and the 0x70 frame, the cookie slot at 0x60 and the three argument moves
+		// are what make it specific - the eight-register prologue with a 0x70 frame on its own
+		// also matches a second, unrelated function in the same module. Verified unique across
+		// the whole .text section of Meridian UI 1.2.0 (link stamp 0x6A9AF1EF, 2026-09-04, image
+		// 0x22B000, Nexus 190723), where the function sits at +0x85410. It is the only caller of
+		// the rasteriser, which is in turn the only function in the module that calls
+		// USER32!DrawIconEx - that chain is how to find it again after an update. The source is
+		// public (github.com/heathbrownkeyworks/MeridianUI, src/UIPlatform/Render/CursorRenderer.cpp).
+		//
+		// Re-check against every new Meridian release. It builds with /Ob3, so a future build
+		// could inline Draw into the render host's frame function, which would turn this into
+		// the Grid Inventory situation rather than a merely stale signature.
+		//
+		// A RET on the first byte is a complete suppression for the same reason it is for
+		// Prisma: Draw returns void, and the RET lands before the frame, the cookie or any
+		// register save. Meridian's own guard around the call - draw only while a browser holds
+		// focus - is untouched, as is the vanilla-cursor hiding it does alongside.
+		constexpr int kMeridianDrawCursorSig[] = {
+			0x48, 0x89, 0x5C, 0x24, 0x18,
+			0x55, 0x56, 0x57,
+			0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+			0x48, 0x83, 0xEC, 0x70,
+			0x48, 0x8B, 0x05,   -1,   -1,   -1,   -1,
+			0x48, 0x33, 0xC4,
+			0x48, 0x89, 0x44, 0x24, 0x60,
+			0x4C, 0x8B, 0xEA,
+			0x4C, 0x8B, 0xF9,
+			0x48, 0x8B, 0x29,
+		};
+
 		CursorStub g_prismaStub{
 			.module = L"PrismaUI.dll",
 			.label = "PrismaUI",
@@ -802,6 +858,14 @@ namespace CursorUnbound
 			// pointer would have been drawn on. Not infinity: an unordered compare leaves the
 			// branch untaken, which is the one outcome that would draw the pointer anyway.
 			.replacement = (std::numeric_limits<float>::max)(),
+		};
+
+		CursorStub g_meridianStub{
+			.module = L"MeridianUI.dll",
+			.label = "Meridian UI",
+			.noun = "Meridian pages",
+			.signature = kMeridianDrawCursorSig,
+			.signatureLength = std::size(kMeridianDrawCursorSig),
 		};
 
 		bool GetTextSection(HMODULE a_module, std::uint8_t*& a_outBegin, std::size_t& a_outSize)
@@ -1154,6 +1218,27 @@ namespace CursorUnbound
 			}
 		}
 
+		bool WantMeridianCursorSuppressed()
+		{
+			const auto& config = Config::Get();
+			switch (config.suppressMeridianCursor) {
+			case CursorSuppression::kOff:
+				return false;
+			case CursorSuppression::kOn:
+				return true;
+			case CursorSuppression::kAuto:
+			default:
+				// Prisma's rule, not Party Sheet's. Meridian draws its pointer only while one of
+				// its browsers holds focus, and taking focus is what opens its focus menu - a
+				// kUsesCursor menu that brings us up. So every moment Meridian wants a pointer is
+				// a moment we are drawing one, and nothing is left uncovered by suppressing for
+				// the whole session. The gamepad gate is the same as everywhere else: Meridian
+				// hides the vanilla cursor while focused, so on a pad its sprite is the only one.
+				return config.enabled && config.useHardwareCursor &&
+					   !g_gamepadMode.load(std::memory_order_relaxed);
+			}
+		}
+
 		bool GridInventoryMenuOpen()
 		{
 			auto* ui = RE::UI::GetSingleton();
@@ -1229,6 +1314,11 @@ namespace CursorUnbound
 			SetCursorStubSuppressed(g_gridInventoryStub, WantGridInventoryCursorSuppressed());
 		}
 
+		void ApplyMeridianCursorPolicy()
+		{
+			SetCursorStubSuppressed(g_meridianStub, WantMeridianCursorSuppressed());
+		}
+
 		// Called wherever any policy's inputs can have changed. All are cheap and idempotent -
 		// SetCursorStubSuppressed early-outs unless the desired state actually differs from the
 		// applied one - so this is safe on the sync timer.
@@ -1237,6 +1327,7 @@ namespace CursorUnbound
 			ApplyPrismaCursorPolicy();
 			ApplyPartySheetCursorPolicy();
 			ApplyGridInventoryCursorPolicy();
+			ApplyMeridianCursorPolicy();
 		}
 
 		// ---------------------------------------------------------------------------
@@ -2760,6 +2851,7 @@ namespace CursorUnbound
 		ResolveCursorStub(g_prismaStub);
 		ResolveCursorStub(g_partySheetStub);
 		ResolveCursorStub(g_gridInventoryStub);
+		ResolveCursorStub(g_meridianStub);
 		ApplyCursorSuppressionPolicies();
 
 		g_runtimeReady.store(true);
@@ -2778,6 +2870,7 @@ namespace CursorUnbound
 		SetCursorStubSuppressed(g_prismaStub, false);
 		SetCursorStubSuppressed(g_partySheetStub, false);
 		SetCursorStubSuppressed(g_gridInventoryStub, false);
+		SetCursorStubSuppressed(g_meridianStub, false);
 
 		if (g_window && ::IsWindow(g_window)) {
 			::KillTimer(g_window, kSyncTimerId);

@@ -189,6 +189,8 @@ namespace CursorUnbound
 					trackPartySheetPanels = ParseBool(value, trackPartySheetPanels);
 				} else if (key == "suppressgridinventorycursor") {
 					suppressGridInventoryCursor = ParseSuppression(value);
+				} else if (key == "suppressmeridiancursor") {
+					suppressMeridianCursor = ParseSuppression(value);
 				} else if (key == "coordinatespace") {
 					const auto v = ToLower(value);
 					if (v == "game") {

@@ -127,6 +127,7 @@ See the comments in `CursorUnbound.ini`. The settings most worth knowing:
 | `SuppressPartySheetCursor` | The same, for Skyrim Party Sheet. |
 | `TrackPartySheetPanels` | Shows the hardware cursor while a Party Sheet panel is open. See below. |
 | `SuppressGridInventoryCursor` | The same, for Grid Inventory's ImGui pointer. Falls back to standing our own cursor down if its signature goes stale. |
+| `SuppressMeridianCursor` | The same, for Meridian UI's present-time cursor sprite. |
 
 Logs go to `Documents\My Games\Skyrim Special Edition\SKSE\CursorUnbound.log`.
 
@@ -134,7 +135,7 @@ Logs go to `Documents\My Games\Skyrim Special Edition\SKSE\CursorUnbound.log`.
 
 Mods that draw their own pointer instead of using the game's cursor menu need explicit
 handling, because their sprite is drawn inside the game frame and so trails the hardware
-cursor. Three are handled:
+cursor. Four are handled:
 
 **PrismaUI** — its cursor sprite is blanked while this plugin is drawing one
 (`SuppressPrismaCursor`). Prisma views drive the cursor menu, so nothing else is needed.
@@ -151,6 +152,16 @@ keeps its own frame-locked pointer. That is why `SuppressPartySheetCursor = auto
 suppresses while this plugin is *active*, rather than for the whole session as Prisma's
 does: suppressing unconditionally would leave the horse picker with no pointer at all.
 
+**[Meridian UI](https://www.nexusmods.com/skyrimspecialedition/mods/190723)** — a Chromium
+framework (Tailor, Horde and Romantasy build on it). While one of its pages has focus it hides
+the game's cursor and draws its own sprite at the end of the frame, from the same cursor fields
+this plugin writes (`SuppressMeridianCursor`).
+
+Nothing extra is needed to make its pages smooth. Taking focus opens a hidden menu that carries
+`kUsesCursor`, so this plugin is already active while a page has focus and already feeding it
+absolute positions. Only the second pointer needed solving, and because Meridian draws it only
+while a page has focus, the suppression follows Prisma's rule and holds for the whole session.
+
 **[Grid Inventory](https://www.nexusmods.com/skyrimspecialedition/mods/188733)** — replaces
 the inventory with a Dear ImGui grid, hides the game's Scaleform cursor itself and draws its
 own arrow at the end of its frame (`SuppressGridInventoryCursor`).
@@ -160,8 +171,8 @@ cursor menu itself, so this plugin is already active while it is up and already 
 absolute positions — Grid Inventory reads the same `MenuCursor` fields this plugin writes.
 Only the second pointer needed solving.
 
-That suppression works differently from the other two, and the difference is worth knowing if
-you are updating the signature. Prisma and Party Sheet each keep their cursor draw in a
+That suppression works differently from the other three, and the difference is worth knowing if
+you are updating the signature. Prisma, Party Sheet and Meridian each keep their cursor draw in a
 function of its own, so a `RET` over its first byte is a complete and reversible suppression.
 Grid Inventory's `DrawPointer` is inlined into the function that draws its entire interface —
 there is no function to stub without taking the whole menu with it. What is still reachable is
@@ -173,15 +184,15 @@ also the safer write: four aligned bytes of read-only data, which the render thr
 every frame cannot observe half-applied, where the equivalent code patch would be six bytes
 over a live instruction.
 
-Because that is a data write rather than a code write, it gets one extra check the other two
+Because that is a data write rather than a code write, it gets one extra check the other three
 do not need — the constant must actually hold the value the guard is documented to compare
 against (`-1000.0`) before anything is written. A signature that has drifted onto an unrelated
 constant refuses instead of corrupting it.
 
-None of the three is a dependency. The detection half for Party Sheet is API-based and
+None of the four is a dependency. The detection half for Party Sheet is API-based and
 survives its updates; every suppression half is a signature (verified against **Party Sheet
-3.1**, link stamp `0x6A68DAC1`, and **Grid Inventory 1.4.3**) and will need revisiting when
-those mods are rebuilt. A stale signature is designed to match nothing: the plugin logs a
+3.1**, link stamp `0x6A68DAC1`, **Grid Inventory 1.4.3** and **Meridian UI 1.2.0**) and will
+need revisiting when those mods are rebuilt. A stale signature is designed to match nothing: the plugin logs a
 warning, leaves the other mod alone, and you get two pointers rather than a crash. The log
 lines to check are `resolved its cursor-draw function at +0x...`, `resolved its pointer guard
 at +0x...` and `cursor suppressed`.
