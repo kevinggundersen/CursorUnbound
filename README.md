@@ -118,12 +118,12 @@ See the comments in `CursorUnbound.ini`. The settings most worth knowing:
 | `HideMethod` | Which mechanism suppresses the game's cursor sprite. `render` is the default and the only one that reliably works; `rootalpha`, `viewport` and `all` are fallbacks. |
 | `AbsolutePositioning` | The speed-scaling fix, independent of the hardware cursor swap. |
 | `NeutralizeGameDelta` | Stops the game integrating movement on top of the absolute position. Disabling it reintroduces overshoot jitter. |
-| `ClipToWindow` | Confines the pointer to the game window while a menu is open. On menu close, whatever clip was in effect before is restored rather than cleared. |
+| `ClipToWindow` | Confines the pointer to the game window while a menu is open. On menu close, the clip is handed back to whichever other mod last asked for one rather than cleared. |
 | `ClipDuringGameplay` | Also confines the hidden pointer during gameplay, for setups without SSE Display Tweaks' `LockCursor`. Off by default. |
 | `CoordinateSpace` | Leave on `auto` unless the cursor is visually offset from where clicks land. |
 | `LogCursorRange` | Diagnostic. Logs the coordinate range the game itself produces. |
 | `BlockGameCursorHide` | Stops the game re-hiding the OS cursor. Disable if it fights another mod. |
-| `HookAllModules` | Also intercepts `ShowCursor` calls from other DLLs (SSEDisplayTweaks, other SKSE plugins), not just the game executable. Turn off if another cursor mod stops working. |
+| `HookAllModules` | Also intercepts `ShowCursor` and `ClipCursor` calls from other DLLs (SSEDisplayTweaks, other SKSE plugins), not just the game executable. Turn off if another cursor mod stops working. |
 | `EnforceHiddenWhenInactive` | Keeps re-hiding the OS cursor while no menu wants it, rather than hiding it once on menu close. Turn off if a mod that wants a pointer during gameplay cannot show one. |
 | `SuppressPrismaCursor` | Blanks PrismaUI's own cursor sprite so it does not double up with the hardware one. |
 | `SuppressPartySheetCursor` | The same, for Skyrim Party Sheet. |
@@ -256,9 +256,15 @@ avoids it. On 1.0.4 the walk is bounds-checked and skips any module it cannot re
 has drifted off the game window. Up to 1.0.9 this plugin caused it whenever SSE Display Tweaks'
 `LockCursor` was in use: Windows keeps a single clip rectangle per process, Display Tweaks
 only re-applies its lock on focus changes, and this plugin cleared the rectangle on every menu
-close, so the first menu you closed cancelled the lock until the next alt-tab. From 1.0.10 the
-clip in effect when a menu opened is put back when it closes. If you do not use Display Tweaks,
-`ClipDuringGameplay = true` confines the pointer for the whole session instead.
+close, so the first menu you closed cancelled the lock until the next alt-tab. 1.0.10 restored
+the clip that was present when the menu opened, which missed the common case: Windows clears the
+clip on every focus change, so if you alt-tabbed back while a menu was up, Display Tweaks' lock
+went on top of this plugin's and there was nothing on record to restore. From 1.0.11 the plugin
+watches other mods' `ClipCursor` calls through the same import hook it uses for `ShowCursor`,
+and on menu close hands the clip back to whoever last asked for one. If it recurs, `LogLevel =
+debug` logs every `ClipCursor` call in the process with the calling module, plus every change
+to the rectangle. If you do not use Display Tweaks, `ClipDuringGameplay = true` confines the
+pointer for the whole session instead.
 
 **Conflicts.** Mods that draw their own pointer (ImGui-based overlays) or manage cursor
 visibility can fight this. Skyrim Souls RE changes which menus are open and is worth
@@ -325,6 +331,7 @@ be uploaded there manually.
 | Position | Vtable detour on `CursorMenu::ProcessMouseMove` (`VTABLE_CursorMenu[1]`, index 4; 6 on 1.7.99 and later). Writes `MenuCursor::cursorPosX/Y` from `GetCursorPos` **before** calling the original, with the event delta zeroed for the duration of that call and restored afterwards. |
 | Drawing | `SetVisible(false)` plus `_root._visible = false` and `_root._alpha = 0` on the Cursor Menu movie; the Win32 hardware cursor draws instead. |
 | Visibility | IAT patch on `USER32!ShowCursor` to swallow the game's hide calls, plus a 15 ms `WM_TIMER` in a subclassed window procedure that re-asserts the display counter and the cursor image. The timer is what makes this work without mouse input - `WM_SETCURSOR` only arrives once the pointer moves, so on its own it cannot bring the cursor up on a menu that just opened. |
+| Clipping | `ClipCursor` to the window client rect while a menu is open. An IAT patch on `USER32!ClipCursor` in every mod DLL records what other mods ask for, so menu close can restore their clip instead of clearing it. The clip check runs from the window procedure on any message rather than from `WM_TIMER`, which Windows only synthesises when the queue is empty and which was observed to starve for over ten seconds during gameplay with the mouse moving. |
 | Art | WIC decode to 32bpp PBGRA, `CreateIconIndirect` with an all-zero AND mask so the alpha channel drives blending. |
 | Gamepad | Vtable detour on `ProcessThumbstick` (same vtable, index 3; 5 on 1.7.99 and later). A stick past a deadzone hands the cursor back to the game; any real mouse delta takes it back. |
 

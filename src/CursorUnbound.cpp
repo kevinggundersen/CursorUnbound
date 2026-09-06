@@ -1,5 +1,7 @@
 #include "CursorUnbound.h"
 
+#include <intrin.h>
+
 #include "Config.h"
 #include "CursorImage.h"
 #include "PartySheetAPI.h"
@@ -23,6 +25,92 @@ namespace CursorUnbound
 		HCURSOR  g_fallbackCursor = nullptr;
 
 		int(WINAPI* g_realShowCursor)(BOOL) = nullptr;
+
+		std::string ModuleNameForAddress(LONG_PTR a_address);
+
+		// ---------------------------------------------------------------------------
+		// ClipCursor tracking
+		//
+		// ClipCursor is one process-wide rectangle and we are not its only user.
+		// SSEDisplayTweaks' LockCursor confines the hidden pointer to the window during
+		// gameplay, and it only ever re-applies that on focus and activation messages. So a
+		// ClipCursor(nullptr) from us on menu close did not just drop our clip, it silently
+		// cancelled theirs for the rest of the session - the pointer drifted onto the next
+		// monitor and the wheel scrolled whatever was under it.
+		//
+		// Reading GetClipCursor on menu open is not enough to hand it back correctly: their
+		// lock is applied on focus, so if the game was in the background when the menu opened
+		// and focus came back mid-menu, the lock was put on top of ours and there was
+		// nothing on record to restore. Hence this hook, on the same import-table footing as
+		// the ShowCursor one: every ClipCursor call from another mod's DLL is recorded, and
+		// menu close restores the last thing someone else asked for.
+		// ---------------------------------------------------------------------------
+
+		BOOL(WINAPI* g_realClipCursor)(const RECT*) = nullptr;
+		HMODULE g_selfModule = nullptr;
+
+		std::mutex g_foreignClipMutex;
+		bool       g_foreignClipValid = false;  // another module currently holds a clip
+		RECT       g_foreignClip{};
+
+		void NoteForeignClip(const RECT* a_rect)
+		{
+			std::scoped_lock lock(g_foreignClipMutex);
+			g_foreignClipValid = a_rect != nullptr;
+			if (a_rect) {
+				g_foreignClip = *a_rect;
+			}
+		}
+
+		bool GetForeignClip(RECT& a_out)
+		{
+			std::scoped_lock lock(g_foreignClipMutex);
+			if (g_foreignClipValid) {
+				a_out = g_foreignClip;
+			}
+			return g_foreignClipValid;
+		}
+
+		// Our own calls are routed through here as well, so the debug log is one ordered
+		// stream of who clipped what; they are told apart by module so they do not count as
+		// foreign.
+		BOOL WINAPI ClipCursorHook(const RECT* a_rect)
+		{
+			const auto caller = reinterpret_cast<LONG_PTR>(_ReturnAddress());
+
+			if (!g_selfModule) {
+				::GetModuleHandleExW(
+					GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					reinterpret_cast<LPCWSTR>(&ClipCursorHook),
+					&g_selfModule);
+			}
+			HMODULE callerModule = nullptr;
+			::GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				reinterpret_cast<LPCWSTR>(caller),
+				&callerModule);
+			const bool foreign = callerModule != g_selfModule;
+
+			if (foreign) {
+				NoteForeignClip(a_rect);
+			}
+
+			const BOOL result = g_realClipCursor ? g_realClipCursor(a_rect) : ::ClipCursor(a_rect);
+
+			if (spdlog::should_log(spdlog::level::debug)) {
+				const std::string rect = a_rect
+					? std::format("({},{},{},{})", a_rect->left, a_rect->top, a_rect->right, a_rect->bottom)
+					: std::string("null");
+				SKSE::log::debug(
+					"[clip] ClipCursor{} from {} (0x{:X}) thread {} -> {}",
+					rect,
+					foreign ? ModuleNameForAddress(caller) : std::string("us"),
+					static_cast<std::uintptr_t>(caller),
+					::GetCurrentThreadId(),
+					result ? "ok" : "FAILED");
+			}
+			return result;
+		}
 
 		void Activate();
 		void Deactivate();
@@ -156,18 +244,10 @@ namespace CursorUnbound
 		// ---------------------------------------------------------------------------
 		// Cursor clipping
 		//
-		// ClipCursor is a single process-wide rectangle, and we are not the only ones
-		// setting it: SSEDisplayTweaks' LockCursor confines the hidden pointer to the window
-		// during gameplay, and it only ever re-applies that on focus and activation
-		// messages. A ClipCursor(nullptr) from us on menu close therefore did not just drop
-		// our clip, it silently cancelled theirs for the rest of the session - the pointer
-		// then drifted onto the next monitor during gameplay and the wheel scrolled whatever
-		// was under it. So we never release a clip we did not set, and on menu close we put
-		// back whichever one was in effect when the menu opened.
+		// Ours goes on while a menu is open (ClipToWindow) and, if asked, stays on through
+		// gameplay (ClipDuringGameplay). We never release a clip we did not set: see the
+		// ClipCursor tracking above for why that needs an import hook rather than a read.
 		// ---------------------------------------------------------------------------
-
-		RECT g_foreignClip{};             // clip in effect when we activated, if any
-		bool g_foreignClipValid = false;
 
 		bool GameWindowIsForeground()
 		{
@@ -194,12 +274,19 @@ namespace CursorUnbound
 			return a_rect.left <= x && a_rect.top <= y && a_rect.right >= x + w && a_rect.bottom >= y + h;
 		}
 
+		// Menu open. The hook sees clips set through a mod DLL's import table; one set any
+		// other way (HookAllModules off, a module the sweep could not read, a system DLL) is
+		// invisible to it, so if the hook has nothing on record and the system reports a
+		// clip anyway, take that as the foreign one.
 		void RememberForeignClip()
 		{
+			RECT known{};
+			if (GetForeignClip(known)) {
+				return;
+			}
 			RECT rect{};
-			g_foreignClipValid = ::GetClipCursor(&rect) && !ClipCoversDesktop(rect);
-			if (g_foreignClipValid) {
-				g_foreignClip = rect;
+			if (::GetClipCursor(&rect) && !ClipCoversDesktop(rect)) {
+				NoteForeignClip(&rect);
 			}
 		}
 
@@ -222,7 +309,7 @@ namespace CursorUnbound
 			}
 
 			RECT screenRect{ topLeft.x, topLeft.y, bottomRight.x, bottomRight.y };
-			::ClipCursor(&screenRect);
+			ClipCursorHook(&screenRect);
 		}
 
 		// Apply the clip the current state calls for, if any. Touches nothing otherwise, so
@@ -234,31 +321,194 @@ namespace CursorUnbound
 			}
 		}
 
-		// Menu close. Hand the clip back to whoever had it, keep it for gameplay if
-		// configured, or release it - and only ever release one we set.
+		// Menu close. Hand the clip back to whoever last asked for one, keep it for gameplay
+		// if configured, or release it - and only ever release one we set.
 		void ReleaseMenuClip()
 		{
 			const auto& config = Config::Get();
-			const bool  remembered = g_foreignClipValid;
-			g_foreignClipValid = false;
-
 			if (!config.clipToWindow) {
 				return;
 			}
 
 			// Restoring anything while another window is in front would confine the pointer
-			// in someone else's application.
+			// in someone else's application. Whoever we are restoring for releases on focus
+			// loss too, and re-applies when focus comes back.
 			if (!GameWindowIsForeground()) {
-				::ClipCursor(nullptr);
+				ClipCursorHook(nullptr);
 				return;
 			}
 
+			RECT foreign{};
 			if (config.clipDuringGameplay) {
 				ApplyClip();
-			} else if (remembered) {
-				::ClipCursor(&g_foreignClip);
+			} else if (GetForeignClip(foreign)) {
+				ClipCursorHook(&foreign);
 			} else {
-				::ClipCursor(nullptr);
+				ClipCursorHook(nullptr);
+			}
+		}
+
+		// Where the clip rectangle currently sits, relative to what we care about.
+		enum class ClipState
+		{
+			kUnknown,
+			kDesktop,  // nothing is clipping
+			kWindow,   // confined to the game window's client area (ours or someone else's)
+			kOther,    // some other rectangle
+		};
+
+		ClipState g_lastClipState = ClipState::kUnknown;
+		RECT      g_lastClipRect{};
+		int       g_clipChangeLines = 0;
+
+		ClipState ClassifyClip(const RECT& a_rect)
+		{
+			if (ClipCoversDesktop(a_rect)) {
+				return ClipState::kDesktop;
+			}
+			HWND hwnd = ResolveGameWindow();
+			RECT client{};
+			if (hwnd && ::GetClientRect(hwnd, &client)) {
+				POINT tl{ client.left, client.top };
+				POINT br{ client.right, client.bottom };
+				if (::ClientToScreen(hwnd, &tl) && ::ClientToScreen(hwnd, &br) &&
+					a_rect.left == tl.x && a_rect.top == tl.y && a_rect.right == br.x && a_rect.bottom == br.y) {
+					return ClipState::kWindow;
+				}
+			}
+			return ClipState::kOther;
+		}
+
+		const char* ClipStateName(ClipState a_state)
+		{
+			switch (a_state) {
+			case ClipState::kDesktop:
+				return "desktop";
+			case ClipState::kWindow:
+				return "window";
+			case ClipState::kOther:
+				return "other";
+			default:
+				return "unknown";
+			}
+		}
+
+		std::string DescribeForegroundWindow()
+		{
+			HWND fg = ::GetForegroundWindow();
+			if (!fg) {
+				return "<none>";
+			}
+			if (fg == ResolveGameWindow()) {
+				return "game";
+			}
+			DWORD pid = 0;
+			::GetWindowThreadProcessId(fg, &pid);
+			char cls[64]{};
+			::GetClassNameA(fg, cls, static_cast<int>(sizeof(cls)));
+			return std::format(
+				"0x{:X} class='{}' {}",
+				reinterpret_cast<std::uintptr_t>(fg),
+				cls,
+				pid == ::GetCurrentProcessId() ? "same process" : std::format("pid {}", pid));
+		}
+
+		// The last few window messages that went through our procedure, dumped whenever the
+		// clip rectangle changes so the change can be tied to whatever the game was doing.
+		struct MsgRecord
+		{
+			DWORD  tick = 0;
+			UINT   msg = 0;
+			WPARAM wparam = 0;
+		};
+
+		constexpr std::size_t kMsgRingSize = 24;
+		MsgRecord             g_msgRing[kMsgRingSize]{};
+		std::size_t           g_msgRingPos = 0;
+
+		void RecordMessage(UINT a_msg, WPARAM a_wparam)
+		{
+			switch (a_msg) {
+			case WM_TIMER:
+			case WM_MOUSEMOVE:
+			case WM_NCMOUSEMOVE:
+			case WM_NCHITTEST:
+			case WM_SETCURSOR:
+			case WM_INPUT:
+			case WM_PAINT:
+			case WM_GETICON:
+				return;
+			default:
+				break;
+			}
+			g_msgRing[g_msgRingPos % kMsgRingSize] = MsgRecord{ ::GetTickCount(), a_msg, a_wparam };
+			++g_msgRingPos;
+		}
+
+		std::string RecentMessages()
+		{
+			const DWORD now = ::GetTickCount();
+			std::string out;
+			const std::size_t count = g_msgRingPos < kMsgRingSize ? g_msgRingPos : kMsgRingSize;
+			for (std::size_t i = 0; i < count; ++i) {
+				const auto& rec = g_msgRing[(g_msgRingPos - count + i) % kMsgRingSize];
+				if (!out.empty()) {
+					out += ' ';
+				}
+				out += std::format("-{}ms:0x{:X}/{}", now - rec.tick, rec.msg, static_cast<std::uintptr_t>(rec.wparam));
+			}
+			return out.empty() ? "<none>" : out;
+		}
+
+		// Runs from the window procedure, throttled, on whatever message comes through - not
+		// from WM_TIMER alone. Windows only synthesises WM_TIMER when the queue is otherwise
+		// empty, and during gameplay with the mouse moving it was observed to starve for over
+		// ten seconds. Logs each change of the clip rectangle (debug), and re-asserts the
+		// gameplay clip if something other than a focus change cleared it, which would
+		// otherwise stay cleared until the next alt-tab.
+		DWORD g_lastClipCheckTick = 0;
+
+		void MonitorClip()
+		{
+			const DWORD now = ::GetTickCount();
+			if (now - g_lastClipCheckTick < 50) {
+				return;
+			}
+			g_lastClipCheckTick = now;
+
+			RECT rect{};
+			if (!::GetClipCursor(&rect)) {
+				return;
+			}
+
+			const ClipState state = ClassifyClip(rect);
+			const bool      changed = state != g_lastClipState ||
+			                     rect.left != g_lastClipRect.left || rect.top != g_lastClipRect.top ||
+			                     rect.right != g_lastClipRect.right || rect.bottom != g_lastClipRect.bottom;
+
+			if (changed) {
+				if (g_clipChangeLines < 200 && spdlog::should_log(spdlog::level::debug)) {
+					++g_clipChangeLines;
+					SKSE::log::debug(
+						"[clip] {} -> {} ({},{},{},{}) | menuActive={} foreground={} capture=0x{:X} | recent msgs: {}",
+						ClipStateName(g_lastClipState),
+						ClipStateName(state),
+						rect.left,
+						rect.top,
+						rect.right,
+						rect.bottom,
+						g_active.load(std::memory_order_relaxed),
+						DescribeForegroundWindow(),
+						reinterpret_cast<std::uintptr_t>(::GetCapture()),
+						RecentMessages());
+				}
+				g_lastClipState = state;
+				g_lastClipRect = rect;
+			}
+
+			if (state != ClipState::kWindow && !g_active.load(std::memory_order_relaxed) &&
+				Config::Get().clipDuringGameplay && GameWindowIsForeground()) {
+				ApplyClip();
 			}
 		}
 
@@ -579,17 +829,35 @@ namespace CursorUnbound
 			return ::CompareStringOrdinal(a_path, len, windows.c_str(), len, TRUE) == CSTR_EQUAL;
 		}
 
+		// Redirects one module's USER32!ClipCursor import to the tracking hook. Returns true
+		// if the module imported it at all.
+		bool PatchClipCursorIn(HMODULE a_module)
+		{
+			auto* slot = FindImportSlot(a_module, "user32.dll", "ClipCursor");
+			if (!slot || *slot == reinterpret_cast<void*>(&ClipCursorHook)) {
+				return slot != nullptr;
+			}
+			if (!g_realClipCursor) {
+				g_realClipCursor = reinterpret_cast<decltype(g_realClipCursor)>(*slot);
+			}
+			REL::safe_write(reinterpret_cast<std::uintptr_t>(slot), reinterpret_cast<std::uintptr_t>(&ClipCursorHook));
+			return true;
+		}
+
 		// The game executable is not the only thing calling ShowCursor. SSEDisplayTweaks in
 		// particular drives cursor visibility for its borderless window, and its calls come
 		// from its own import table - which is why a session could end up with the display
-		// counter at -3 while we believed we had forced the pointer visible.
+		// counter at -3 while we believed we had forced the pointer visible. ClipCursor is
+		// the same story (see the tracking hook), so both imports go through this one sweep.
 		//
 		// Run once every SKSE plugin is loaded, so the sweep sees them.
-		void PatchShowCursorEverywhere()
+		void PatchImportsEverywhere(const char* a_function, bool (*a_patchIn)(HMODULE))
 		{
 			HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, ::GetCurrentProcessId());
 			if (snapshot == INVALID_HANDLE_VALUE) {
-				SKSE::log::warn("Could not enumerate loaded modules; only the game import table is hooked.");
+				SKSE::log::warn(
+					"Could not enumerate loaded modules; only the game import table is hooked for USER32!{}.",
+					a_function);
 				return;
 			}
 
@@ -609,8 +877,8 @@ namespace CursorUnbound
 			entry.dwSize = sizeof(entry);
 			if (::Module32FirstW(snapshot, &entry)) {
 				do {
-					// Skipping ourselves keeps RealShowCursor's ::ShowCursor fallback from
-					// re-entering the hook if the slot capture above ever came up empty.
+					// Skipping ourselves keeps the hooks' ::ShowCursor / ::ClipCursor fallbacks
+					// from re-entering if the slot capture ever came up empty.
 					if (!entry.hModule || entry.hModule == self || entry.hModule == user32 ||
 						IsSystemModule(entry.szExePath)) {
 						continue;
@@ -618,7 +886,7 @@ namespace CursorUnbound
 
 					// Named before it is walked, not after, so that if a module ever does
 					// take the process down here the log says which one it was.
-					SKSE::log::debug("Sweeping {} for USER32!ShowCursor.", Narrow(entry.szModule));
+					SKSE::log::debug("Sweeping {} for USER32!{}.", Narrow(entry.szModule), a_function);
 
 					// The snapshot lists modules that were loaded a moment ago. Take a real
 					// reference before reading one, so it cannot be unmapped mid-walk. The
@@ -638,7 +906,7 @@ namespace CursorUnbound
 						referenced = true;
 					}
 
-					const bool imported = PatchShowCursorIn(target);
+					const bool imported = a_patchIn(target);
 
 					if (referenced) {
 						::FreeLibrary(target);
@@ -656,7 +924,11 @@ namespace CursorUnbound
 
 			::CloseHandle(snapshot);
 
-			SKSE::log::info("Patched USER32!ShowCursor in {} module(s): {}", patched, names);
+			SKSE::log::info(
+				"Patched USER32!{} in {} module(s): {}",
+				a_function,
+				patched,
+				names.empty() ? std::string("<none>") : names);
 		}
 
 		// ---------------------------------------------------------------------------
@@ -2410,7 +2682,7 @@ namespace CursorUnbound
 			ApplyCursorSuppressionPolicies();
 		}
 
-		LRESULT CALLBACK WndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wparam, LPARAM a_lparam)
+		LRESULT CALLBACK WndProcInner(HWND a_hwnd, UINT a_msg, WPARAM a_wparam, LPARAM a_lparam)
 		{
 			switch (a_msg) {
 			case WM_TIMER:
@@ -2481,7 +2753,7 @@ namespace CursorUnbound
 							AssertCursorState();
 						}
 					} else if (WantClip()) {
-						::ClipCursor(nullptr);
+						ClipCursorHook(nullptr);
 					}
 				}
 				break;
@@ -2496,7 +2768,7 @@ namespace CursorUnbound
 				// g_originalWndProc, which this same function is about to call through.
 				// Touching the UI singleton during teardown is not worth the risk either.
 				g_active.store(false);
-				::ClipCursor(nullptr);
+				ClipCursorHook(nullptr);
 				break;
 
 			default:
@@ -2506,6 +2778,43 @@ namespace CursorUnbound
 			return g_windowIsUnicode
 				? ::CallWindowProcW(g_originalWndProc, a_hwnd, a_msg, a_wparam, a_lparam)
 				: ::CallWindowProcA(g_originalWndProc, a_hwnd, a_msg, a_wparam, a_lparam);
+		}
+
+		// Every message passes through here. MonitorClip runs on the way in (see there for
+		// why not from WM_TIMER). At debug level the clip rectangle is also sampled either
+		// side of the rest of the chain, so a change made by anyone downstream of us
+		// (BetterAltTab, SSEDisplayTweaks, Improved Camera, an ImGui subclass) while handling
+		// a message is attributed to that message.
+		LRESULT CALLBACK WndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wparam, LPARAM a_lparam)
+		{
+			MonitorClip();
+
+			if (!spdlog::should_log(spdlog::level::debug)) {
+				return WndProcInner(a_hwnd, a_msg, a_wparam, a_lparam);
+			}
+
+			RecordMessage(a_msg, a_wparam);
+
+			RECT       before{};
+			const bool haveBefore = ::GetClipCursor(&before) != FALSE;
+
+			const LRESULT result = WndProcInner(a_hwnd, a_msg, a_wparam, a_lparam);
+
+			RECT after{};
+			if (haveBefore && ::GetClipCursor(&after) && !::EqualRect(&before, &after) && g_clipChangeLines < 200) {
+				++g_clipChangeLines;
+				SKSE::log::debug(
+					"[clip] changed while message 0x{:X} (wparam={}) was handled: ({},{},{},{}) -> ({},{},{},{}) | "
+					"menuActive={} foreground={} capture=0x{:X}",
+					a_msg,
+					static_cast<std::uintptr_t>(a_wparam),
+					before.left, before.top, before.right, before.bottom,
+					after.left, after.top, after.right, after.bottom,
+					g_active.load(std::memory_order_relaxed),
+					DescribeForegroundWindow(),
+					reinterpret_cast<std::uintptr_t>(::GetCapture()));
+			}
+			return result;
 		}
 
 		void HookWindowProc()
@@ -2929,8 +3238,13 @@ namespace CursorUnbound
 	{
 		// Deferred to kDataLoaded rather than done alongside the executable patch above, so
 		// the sweep sees every SKSE plugin that will ever be loaded.
-		if (Config::Get().blockGameCursorHide && Config::Get().hookAllModules) {
-			PatchShowCursorEverywhere();
+		if (Config::Get().hookAllModules) {
+			if (Config::Get().blockGameCursorHide) {
+				PatchImportsEverywhere("ShowCursor", &PatchShowCursorIn);
+			}
+			if (Config::Get().clipToWindow) {
+				PatchImportsEverywhere("ClipCursor", &PatchClipCursorIn);
+			}
 		}
 
 		ResolveGameWindow();
