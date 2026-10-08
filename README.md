@@ -124,6 +124,7 @@ See the comments in `CursorUnbound.ini`. The settings most worth knowing:
 | `LogCursorRange` | Diagnostic. Logs the coordinate range the game itself produces. |
 | `BlockGameCursorHide` | Stops the game re-hiding the OS cursor. Disable if it fights another mod. |
 | `HookAllModules` | Also intercepts `ShowCursor` and `ClipCursor` calls from other DLLs (SSEDisplayTweaks, other SKSE plugins), not just the game executable. Turn off if another cursor mod stops working. |
+| `ShowCursorInBackground` | Shows the normal arrow over the game window while you are alt-tabbed out, so a click meant for another window does not land on the game and pull it back into focus. |
 | `EnforceHiddenWhenInactive` | Keeps re-hiding the OS cursor while no menu wants it, rather than hiding it once on menu close. Turn off if a mod that wants a pointer during gameplay cannot show one. |
 | `SuppressPrismaCursor` | Blanks PrismaUI's own cursor sprite so it does not double up with the hardware one. |
 | `SuppressPartySheetCursor` | The same, for Skyrim Party Sheet. |
@@ -265,6 +266,15 @@ and on menu close hands the clip back to whoever last asked for one. If it recur
 debug` logs every `ClipCursor` call in the process with the calling module, plus every change
 to the rectangle. If you do not use Display Tweaks, `ClipDuringGameplay = true` confines the
 pointer for the whole session instead.
+
+**After alt-tab the pointer seems locked, and clicking just puts you back in the game.** In
+borderless mode the game window still covers its monitor while you are tabbed out, and the
+pointer is usually left on top of it. The game keeps the pointer hidden over its own window
+whether it has focus or not, so you cannot see it, and a click there - often the one you make
+looking for it - goes to the game, which takes focus back and has SSE Display Tweaks lock the
+pointer again. Nothing is actually holding the mouse. From 1.0.12 `ShowCursorInBackground`
+shows the normal arrow over the game window while it is out of focus, so you can see where the
+pointer is and move it off the game before clicking.
 
 **Conflicts.** Mods that draw their own pointer (ImGui-based overlays) or manage cursor
 visibility can fight this. Skyrim Souls RE changes which menus are open and is worth

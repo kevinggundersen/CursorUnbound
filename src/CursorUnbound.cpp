@@ -543,9 +543,13 @@ namespace CursorUnbound
 		// it was on entry and whoever moved it. Overshooting in either direction has bitten
 		// us before: a counter left at -3 needs three increments before the pointer appears,
 		// and one left high cannot be undone by a single decrement.
-		void ForceCursorShown()
+		//
+		// ForceCursorShown reports whether the pointer was hidden on entry, which the
+		// background pointer needs to know whether it has anything to undo on refocus.
+		bool ForceCursorShown()
 		{
-			int count = RealShowCursor(TRUE);
+			int        count = RealShowCursor(TRUE);
+			const bool wasHidden = count <= 0;
 			for (int i = 0; i < 64 && count > 0; ++i) {
 				count = RealShowCursor(FALSE);
 			}
@@ -553,6 +557,7 @@ namespace CursorUnbound
 				count = RealShowCursor(TRUE);
 			}
 			g_lastCursorCount = count;
+			return wasHidden;
 		}
 
 		void ForceCursorHidden()
@@ -2643,6 +2648,83 @@ namespace CursorUnbound
 			ForceCursorHidden();
 		}
 
+		// ---------------------------------------------------------------------------
+		// Pointer while unfocused
+		//
+		// In borderless mode the game window still covers its monitor after alt-tab, and the
+		// pointer is wherever the game left it, usually on top of that window. The display
+		// counter belongs to the game's thread, so over the game window the pointer stays as
+		// hidden as it was in gameplay. A click there, made to find it, lands on the game and
+		// activates it, and Display Tweaks locks the pointer again. Showing the pointer over
+		// the unfocused window makes it visible where it actually is.
+		//
+		// The standard arrow rather than the configured art: out of focus the window is part
+		// of the desktop, and the arrow is what every other window there shows.
+		//
+		// Main thread only: everything here runs from the window procedure.
+		// ---------------------------------------------------------------------------
+
+		bool g_inBackground = false;
+		bool g_raisedInBackground = false;  // we lifted a hidden pointer and owe a hide on refocus
+
+		bool BackgroundPointerWanted()
+		{
+			return g_inBackground && Config::Get().showCursorInBackground;
+		}
+
+		bool PointerIsOverGameWindow()
+		{
+			POINT pt{};
+			if (!g_window || !::GetCursorPos(&pt)) {
+				return false;
+			}
+			HWND under = ::WindowFromPoint(pt);
+			return under && ::GetAncestor(under, GA_ROOT) == g_window;
+		}
+
+		void AssertBackgroundPointer()
+		{
+			if (ForceCursorShown()) {
+				g_raisedInBackground = true;
+			}
+			if (HCURSOR arrow = g_fallbackCursor ? g_fallbackCursor : ::LoadCursorW(nullptr, IDC_ARROW)) {
+				::SetCursor(arrow);
+			}
+		}
+
+		void EnterBackground()
+		{
+			if (g_inBackground) {
+				return;
+			}
+			g_inBackground = true;
+			if (Config::Get().showCursorInBackground) {
+				AssertBackgroundPointer();
+			}
+		}
+
+		// Hide again only what we revealed, and only when the pointer is not ours to show:
+		// a menu that wants the hardware cursor keeps it, and a pointer some other mod had
+		// visible before alt-tab was never raised by us in the first place.
+		void LeaveBackground()
+		{
+			if (!g_inBackground) {
+				return;
+			}
+			g_inBackground = false;
+			if (!g_raisedInBackground) {
+				return;
+			}
+			g_raisedInBackground = false;
+
+			const bool ours = g_active.load(std::memory_order_relaxed) && Config::Get().useHardwareCursor &&
+			                  !g_gamepadMode.load(std::memory_order_relaxed) &&
+			                  !g_yieldPointer.load(std::memory_order_relaxed);
+			if (!ours) {
+				ForceCursorHidden();
+			}
+		}
+
 		// a_force bypasses the throttle, for the callers that are reacting to a menu event
 		// rather than polling.
 		void SyncActiveState(bool a_force = false)
@@ -2693,6 +2775,9 @@ namespace CursorUnbound
 					++g_stats.wmTimer;
 					SyncActiveState();
 					if (!g_window || ::GetForegroundWindow() == g_window) {
+						// Backs up the activation messages, which another subclass in the
+						// chain could swallow.
+						LeaveBackground();
 						AssertCursorState();
 						AssertCursorHidden();
 						// The game cursor needs the same treatment as the OS one, and for the
@@ -2702,6 +2787,13 @@ namespace CursorUnbound
 						// pointer on screen until the player moved it.
 						ReassertScaleformHidden();
 						ReassertScaleformShown();
+					} else {
+						EnterBackground();
+						// A pointer resting over the window gets no mouse messages, so a hide
+						// from anywhere in the process would otherwise stick until it moved.
+						if (BackgroundPointerWanted() && PointerIsOverGameWindow()) {
+							AssertBackgroundPointer();
+						}
 					}
 					return 0;
 				}
@@ -2712,6 +2804,10 @@ namespace CursorUnbound
 				// Re-assert the image here too. WM_SETCURSOR is not guaranteed to arrive on
 				// every move if something else in the process answers it first.
 				SyncActiveState();
+				if (BackgroundPointerWanted()) {
+					AssertBackgroundPointer();
+					break;
+				}
 				AssertCursorState();
 				AssertCursorHidden();
 				break;
@@ -2722,6 +2818,11 @@ namespace CursorUnbound
 				// the cursor image. Answering it rather than falling through to DefWindowProc
 				// is what stops the window class cursor being applied over ours a moment later.
 				SyncActiveState();
+				if (BackgroundPointerWanted() && LOWORD(a_lparam) == HTCLIENT) {
+					AssertBackgroundPointer();
+					++g_stats.wmSetCursorAnswered;
+					return TRUE;
+				}
 				if (g_active.load(std::memory_order_relaxed) && Config::Get().useHardwareCursor &&
 					!g_gamepadMode.load(std::memory_order_relaxed) &&
 					!g_yieldPointer.load(std::memory_order_relaxed) && LOWORD(a_lparam) == HTCLIENT) {
@@ -2748,12 +2849,16 @@ namespace CursorUnbound
 						// to the window is exactly when a menu we never saw open has to be picked
 						// up.
 						SyncActiveState();
+						LeaveBackground();
 						AssertClip();
 						if (g_active.load(std::memory_order_relaxed)) {
 							AssertCursorState();
 						}
-					} else if (WantClip()) {
-						ClipCursorHook(nullptr);
+					} else {
+						if (WantClip()) {
+							ClipCursorHook(nullptr);
+						}
+						EnterBackground();
 					}
 				}
 				break;

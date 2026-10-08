@@ -79,6 +79,11 @@ namespace CursorUnbound
 		// ShowCursor(TRUE) afterwards strands the pointer on screen for the rest of the
 		// session.
 		bool            enforceHiddenWhenInactive = true;
+		// Show the standard arrow over the game window while the game is not in focus. In
+		// borderless mode the window still covers its monitor after alt-tab and the pointer
+		// is usually left on top of it, hidden, so a click meant to find it lands on the game
+		// and pulls it back into focus.
+		bool            showCursorInBackground = true;
 		// Patch USER32!ShowCursor in every loaded module's import table, not just the game
 		// executable's. Without this, hide calls coming from another DLL bypass the hook.
 		bool            hookAllModules = true;

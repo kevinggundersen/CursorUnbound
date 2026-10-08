@@ -179,6 +179,8 @@ namespace CursorUnbound
 					blockGameCursorHide = ParseBool(value, blockGameCursorHide);
 				} else if (key == "enforcehiddenwheninactive") {
 					enforceHiddenWhenInactive = ParseBool(value, enforceHiddenWhenInactive);
+				} else if (key == "showcursorinbackground") {
+					showCursorInBackground = ParseBool(value, showCursorInBackground);
 				} else if (key == "hookallmodules") {
 					hookAllModules = ParseBool(value, hookAllModules);
 				} else if (key == "synconmenuopen") {
