@@ -84,6 +84,14 @@ namespace CursorUnbound
 		// is usually left on top of it, hidden, so a click meant to find it lands on the game
 		// and pulls it back into focus.
 		bool            showCursorInBackground = true;
+		// Stall watchdog. When the main thread stops handling window messages (a loading
+		// screen that blocks it, or a freeze) and the player alt-tabs away, release what the
+		// focus loss would have released had the thread been running: the cursor clip, and
+		// the game's exclusive hold on the mouse. The threshold is how long the window
+		// procedure has to go quiet before that counts as stuck.
+		bool            releaseCursorOnStall = true;
+		bool            releaseMouseOnStall = true;
+		int             stallThresholdMs = 500;
 		// Patch USER32!ShowCursor in every loaded module's import table, not just the game
 		// executable's. Without this, hide calls coming from another DLL bypass the hook.
 		bool            hookAllModules = true;

@@ -2725,6 +2725,269 @@ namespace CursorUnbound
 			}
 		}
 
+		// ---------------------------------------------------------------------------
+		// Stall watchdog
+		//
+		// Everything that holds the pointer while the game is in front is let go from the
+		// game's main thread, in response to the focus-loss messages: Display Tweaks drops
+		// its clip from its message hook, and DirectInput drops its exclusive hold on the
+		// mouse when the game window deactivates. During a loading screen that blocks the
+		// main thread, or a freeze, nothing handles those messages, so alt-tabbing out leaves
+		// the pointer confined and the mouse held until the thread comes back - or until
+		// Ctrl+Alt+Del resets input.
+		//
+		// The watchdog is a thread of its own that watches for the window procedure going
+		// quiet. The sync timer guarantees a message every 15 ms or so while the thread is
+		// pumping, so a long silence means it is not. If the player tries to leave during
+		// one (another window in front, or Alt+Tab held), it releases the clip and unacquires
+		// the game's mouse - the same things the focus loss would have done, just from a
+		// thread that is still running. The pointer's visibility over the game window is
+		// the one thing it cannot fix: the display counter belongs to the stuck thread.
+		// ---------------------------------------------------------------------------
+
+		std::atomic<std::uint64_t> g_lastPumpTick{ 0 };  // GetTickCount64 at the last message we handled
+		std::atomic<bool>          g_watchdogStop{ false };
+		std::atomic<bool>          g_unacquirePending{ false };
+		std::atomic<std::uint64_t> g_unacquireStartTick{ 0 };
+
+		// Set by the watchdog when it took the mouse away, cleared by the main thread when it
+		// has handed it back. Only an Acquire on refocus depends on it.
+		std::atomic<bool> g_mouseReleasedByWatchdog{ false };
+
+		// The game's DirectInput mouse, with a reference held for the caller. The device
+		// manager can be mid-teardown when the game is exiting, and the pointer is read from
+		// a thread the game knows nothing about, so the read is fenced with SEH: a bad read
+		// costs one release attempt, not the process.
+		REX::W32::IDirectInputDevice8A* AcquireGameMouseRef()
+		{
+			__try {
+				auto* manager = RE::BSInputDeviceManager::GetSingleton();
+				auto* mouse = manager ? manager->GetMouse() : nullptr;
+				auto* device = mouse ? mouse->GetRuntimeData().dInputDevice : nullptr;
+				if (device) {
+					device->AddRef();
+				}
+				return device;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return nullptr;
+			}
+		}
+
+		bool GameMouseIsBackground()
+		{
+			__try {
+				auto* manager = RE::BSInputDeviceManager::GetSingleton();
+				return manager && manager->IsMouseBackground();
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		// Unacquire runs on a throwaway thread. DirectInput may need the window's own thread
+		// to finish it - that is the thread that is stuck - and the watchdog has to stay free
+		// to report that rather than hang alongside it.
+		DWORD WINAPI UnacquireThread(LPVOID a_device)
+		{
+			auto*         device = static_cast<REX::W32::IDirectInputDevice8A*>(a_device);
+			const auto    start = ::GetTickCount64();
+			const HRESULT hr = device->Unacquire();
+			device->Release();
+			SKSE::log::info(
+				"[stall] Released the game's mouse (Unacquire 0x{:08X}, {} ms).",
+				static_cast<std::uint32_t>(hr),
+				::GetTickCount64() - start);
+			g_unacquirePending.store(false);
+			return 0;
+		}
+
+		bool ReleaseGameMouse()
+		{
+			if (g_unacquirePending.load()) {
+				return false;
+			}
+			auto* device = AcquireGameMouseRef();
+			if (!device) {
+				SKSE::log::warn("[stall] Could not reach the game's mouse device; mouse not released.");
+				return false;
+			}
+
+			g_unacquirePending.store(true);
+			g_unacquireStartTick.store(::GetTickCount64());
+			g_mouseReleasedByWatchdog.store(true);
+			HANDLE thread = ::CreateThread(nullptr, 0, &UnacquireThread, device, 0, nullptr);
+			if (!thread) {
+				SKSE::log::warn("[stall] Could not start the unacquire thread (error {}).", ::GetLastError());
+				device->Release();
+				g_unacquirePending.store(false);
+				g_mouseReleasedByWatchdog.store(false);
+				return false;
+			}
+			::CloseHandle(thread);
+			return true;
+		}
+
+		// Main thread, on activation. The game reacquires a lost device by itself as far as
+		// we know, but if it does not, a mouse the watchdog took away would stay dead in game.
+		// Acquire on an already-acquired device is a harmless S_FALSE.
+		void ReacquireGameMouse()
+		{
+			if (!g_mouseReleasedByWatchdog.exchange(false)) {
+				return;
+			}
+			if (auto* device = AcquireGameMouseRef()) {
+				const HRESULT hr = device->Acquire();
+				device->Release();
+				SKSE::log::info("[stall] Reacquired the game's mouse on refocus (0x{:08X}).", static_cast<std::uint32_t>(hr));
+			}
+		}
+
+		std::string DescribeClip()
+		{
+			RECT rect{};
+			if (!::GetClipCursor(&rect)) {
+				return "unknown";
+			}
+			if (ClipCoversDesktop(rect)) {
+				return "none";
+			}
+			return std::format("({},{},{},{})", rect.left, rect.top, rect.right, rect.bottom);
+		}
+
+		struct StallState
+		{
+			bool          stalled = false;
+			std::uint64_t since = 0;  // tick of the last message before the stall
+			bool          leaving = false;
+			int           clipReleases = 0;
+			bool          mouseReleased = false;
+			bool          unacquireSlowLogged = false;
+		};
+
+		void EndStall(StallState& a_state, std::uint64_t a_now)
+		{
+			const auto duration = a_now - a_state.since;
+			if (a_state.leaving) {
+				SKSE::log::info(
+					"[stall] Main thread responsive again after {} ms (clip released {}x, mouse released={}).",
+					duration,
+					a_state.clipReleases,
+					a_state.mouseReleased);
+			} else {
+				SKSE::log::debug("[stall] Main thread responsive again after {} ms.", duration);
+			}
+			a_state = {};
+		}
+
+		void WatchdogTick(StallState& a_state)
+		{
+			const auto& config = Config::Get();
+			const auto  now = ::GetTickCount64();
+			const auto  last = g_lastPumpTick.load(std::memory_order_relaxed);
+			if (last == 0) {
+				return;  // the window procedure has not run yet
+			}
+
+			if (const auto started = g_unacquireStartTick.load();
+				g_unacquirePending.load() && !a_state.unacquireSlowLogged && now - started > 1000) {
+				a_state.unacquireSlowLogged = true;
+				SKSE::log::warn(
+					"[stall] Unacquire has not returned after {} ms; DirectInput is probably waiting on the "
+					"stuck main thread. Set ReleaseMouseOnStall = false if this coincides with problems.",
+					now - started);
+			}
+
+			const auto silent = now > last ? now - last : 0;
+			if (silent < static_cast<std::uint64_t>(config.stallThresholdMs)) {
+				if (a_state.stalled) {
+					EndStall(a_state, now);
+				}
+				return;
+			}
+
+			if (!a_state.stalled) {
+				a_state.stalled = true;
+				a_state.since = last;
+				SKSE::log::debug(
+					"[stall] Main thread has not handled a message for {} ms | foreground={} clip={}",
+					silent,
+					DescribeForegroundWindow(),
+					DescribeClip());
+			}
+
+			const HWND fg = ::GetForegroundWindow();
+			const bool away = fg != g_window;
+			const bool altTab = (::GetAsyncKeyState(VK_MENU) & 0x8000) && (::GetAsyncKeyState(VK_TAB) & 0x8000);
+			if (!away && !altTab) {
+				return;
+			}
+
+			if (!a_state.leaving) {
+				a_state.leaving = true;
+				SKSE::log::info(
+					"[stall] Leaving while the main thread is stuck ({} ms): {} | foreground={} clip={} "
+					"gameMouse={}",
+					silent,
+					away ? "another window is in front" : "Alt+Tab held",
+					DescribeForegroundWindow(),
+					DescribeClip(),
+					GameMouseIsBackground() ? "background" : "exclusive");
+			}
+
+			if (config.releaseCursorOnStall) {
+				RECT rect{};
+				if (::GetClipCursor(&rect) && !ClipCoversDesktop(rect)) {
+					ClipCursorHook(nullptr);
+					++a_state.clipReleases;
+					SKSE::log::info(
+						"[stall] Released the cursor clip ({},{},{},{}).",
+						rect.left,
+						rect.top,
+						rect.right,
+						rect.bottom);
+				}
+			}
+
+			// Once per stall. A background (non-exclusive) mouse holds nothing to release.
+			if (config.releaseMouseOnStall && !a_state.mouseReleased && !GameMouseIsBackground()) {
+				a_state.mouseReleased = ReleaseGameMouse();
+			}
+		}
+
+		DWORD WINAPI WatchdogThread(LPVOID)
+		{
+			StallState state;
+			while (!g_watchdogStop.load()) {
+				::Sleep(50);
+				if (!g_watchdogStop.load()) {
+					WatchdogTick(state);
+				}
+			}
+			return 0;
+		}
+
+		void StartWatchdog()
+		{
+			const auto& config = Config::Get();
+			if (!config.releaseCursorOnStall && !config.releaseMouseOnStall) {
+				return;
+			}
+
+			// Never joined: it holds nothing that needs tearing down, and joining a thread
+			// from shutdown paths that can run under the loader lock is how plugins deadlock.
+			HANDLE thread = ::CreateThread(nullptr, 0, &WatchdogThread, nullptr, 0, nullptr);
+			if (!thread) {
+				SKSE::log::warn("Could not start the stall watchdog (error {}).", ::GetLastError());
+				return;
+			}
+			::CloseHandle(thread);
+			SKSE::log::info(
+				"Stall watchdog started (threshold {} ms, releaseCursor={}, releaseMouse={}, gameMouse={}).",
+				config.stallThresholdMs,
+				config.releaseCursorOnStall,
+				config.releaseMouseOnStall,
+				GameMouseIsBackground() ? "background" : "exclusive");
+		}
+
 		// a_force bypasses the throttle, for the callers that are reacting to a menu event
 		// rather than polling.
 		void SyncActiveState(bool a_force = false)
@@ -2850,6 +3113,7 @@ namespace CursorUnbound
 						// up.
 						SyncActiveState();
 						LeaveBackground();
+						ReacquireGameMouse();
 						AssertClip();
 						if (g_active.load(std::memory_order_relaxed)) {
 							AssertCursorState();
@@ -2873,6 +3137,7 @@ namespace CursorUnbound
 				// g_originalWndProc, which this same function is about to call through.
 				// Touching the UI singleton during teardown is not worth the risk either.
 				g_active.store(false);
+				g_watchdogStop.store(true);
 				ClipCursorHook(nullptr);
 				break;
 
@@ -2892,6 +3157,8 @@ namespace CursorUnbound
 		// a message is attributed to that message.
 		LRESULT CALLBACK WndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wparam, LPARAM a_lparam)
 		{
+			// The stall watchdog's heartbeat.
+			g_lastPumpTick.store(::GetTickCount64(), std::memory_order_relaxed);
 			MonitorClip();
 
 			if (!spdlog::should_log(spdlog::level::debug)) {
@@ -2968,8 +3235,11 @@ namespace CursorUnbound
 			if (!timerOk) {
 				SKSE::log::warn(
 					"Could not start the sync timer (error {}); menus will only pick the cursor up "
-					"once the mouse moves.",
+					"once the mouse moves. The stall watchdog is off too: it needs the timer's steady "
+					"messages to tell a stuck main thread from an idle one.",
 					::GetLastError());
+			} else {
+				StartWatchdog();
 			}
 		}
 
@@ -3373,6 +3643,7 @@ namespace CursorUnbound
 
 	void Shutdown()
 	{
+		g_watchdogStop.store(true);
 		Deactivate();
 
 		// Hand every patched mod its own code back before we go, so a reloaded or unloaded

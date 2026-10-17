@@ -125,6 +125,7 @@ See the comments in `CursorUnbound.ini`. The settings most worth knowing:
 | `BlockGameCursorHide` | Stops the game re-hiding the OS cursor. Disable if it fights another mod. |
 | `HookAllModules` | Also intercepts `ShowCursor` and `ClipCursor` calls from other DLLs (SSEDisplayTweaks, other SKSE plugins), not just the game executable. Turn off if another cursor mod stops working. |
 | `ShowCursorInBackground` | Shows the normal arrow over the game window while you are alt-tabbed out, so a click meant for another window does not land on the game and pull it back into focus. |
+| `ReleaseCursorOnStall` / `ReleaseMouseOnStall` | When you alt-tab out of a loading screen or a freeze, release the cursor lock and the game's hold on the mouse, which the stuck game cannot do itself. |
 | `EnforceHiddenWhenInactive` | Keeps re-hiding the OS cursor while no menu wants it, rather than hiding it once on menu close. Turn off if a mod that wants a pointer during gameplay cannot show one. |
 | `SuppressPrismaCursor` | Blanks PrismaUI's own cursor sprite so it does not double up with the hardware one. |
 | `SuppressPartySheetCursor` | The same, for Skyrim Party Sheet. |
@@ -275,6 +276,17 @@ looking for it - goes to the game, which takes focus back and has SSE Display Tw
 pointer again. Nothing is actually holding the mouse. From 1.0.12 `ShowCursorInBackground`
 shows the normal arrow over the game window while it is out of focus, so you can see where the
 pointer is and move it off the game before clicking.
+
+**The cursor stays locked when you alt-tab out of a loading screen, or the game freezes and
+only Ctrl+Alt+Del gets the cursor back.** The cursor lock and the game's hold on the mouse are
+both let go by the game's main thread when it notices it lost focus, and a thread stuck in a
+load or a freeze notices nothing. From 1.0.13 a watchdog thread spots the game going quiet and,
+if you switch away during it, releases both itself (`ReleaseCursorOnStall`,
+`ReleaseMouseOnStall`). The pointer stays invisible over the stuck game window but works
+everywhere else. Each stall you leave is logged with `[stall]` lines saying what was released;
+if the mouse is dead in game after one, set `ReleaseMouseOnStall = false` and report the log.
+If you alt-tab out of a loading screen and no `[stall]` lines appear, the game was not stuck,
+and whatever held the cursor was something else.
 
 **Conflicts.** Mods that draw their own pointer (ImGui-based overlays) or manage cursor
 visibility can fight this. Skyrim Souls RE changes which menus are open and is worth

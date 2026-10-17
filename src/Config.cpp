@@ -181,6 +181,12 @@ namespace CursorUnbound
 					enforceHiddenWhenInactive = ParseBool(value, enforceHiddenWhenInactive);
 				} else if (key == "showcursorinbackground") {
 					showCursorInBackground = ParseBool(value, showCursorInBackground);
+				} else if (key == "releasecursoronstall") {
+					releaseCursorOnStall = ParseBool(value, releaseCursorOnStall);
+				} else if (key == "releasemouseonstall") {
+					releaseMouseOnStall = ParseBool(value, releaseMouseOnStall);
+				} else if (key == "stallthresholdms") {
+					stallThresholdMs = std::max(100, ParseInt(value, stallThresholdMs));
 				} else if (key == "hookallmodules") {
 					hookAllModules = ParseBool(value, hookAllModules);
 				} else if (key == "synconmenuopen") {

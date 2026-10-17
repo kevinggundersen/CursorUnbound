@@ -10,7 +10,7 @@ endif()
 
 project(
 	CursorUnbound
-	VERSION 1.0.12
+	VERSION 1.0.13
 	DESCRIPTION "Decouples the Skyrim menu cursor from the game frame rate."
 	LANGUAGES CXX RC
 )

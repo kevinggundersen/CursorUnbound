@@ -16,3 +16,23 @@
   the plugin overriding the game's own hide calls outside menus for the first time.
 - **Hidden again on refocus only if the plugin lifted it, and only when no menu wants the
   hardware cursor.** A pointer another mod had visible before alt-tab is left alone.
+
+## Stall watchdog (1.0.13)
+
+- **Both releases on by default, as separate settings.** `ReleaseCursorOnStall` only undoes a
+  clip, which is what focus loss does anyway. `ReleaseMouseOnStall` calls into DirectInput from
+  outside the game's thread, which is the riskier half; it is on so the first test shows whether
+  it helps, and it can be turned off on its own. Alternative: mouse release off until proven.
+- **"Stuck" means the window procedure has gone quiet for 500 ms.** The sync timer delivers a
+  message every ~15 ms while the thread pumps, so silence is unambiguous. The threshold is low
+  because acting early costs nothing: the watchdog only releases what switching away would
+  have released anyway. Alternative: a longer threshold (1-5 s) closer to Windows' 5 s hang
+  definition.
+- **Triggered by another window coming to the front, or Alt+Tab being held.** The second
+  covers the case where alt-tab itself does not get anywhere while the game is stuck.
+- **Unacquire runs on a throwaway thread; Acquire runs on the main thread on refocus.**
+  DirectInput may need the stuck thread to finish an Unacquire, and the watchdog must not hang
+  with it. Acquire on refocus guards against the game not reacquiring a device it lost.
+- **The pointer stays hidden over the stuck game window.** Its display counter belongs to the
+  stuck thread. Attaching the watchdog to that thread's input queue (AttachThreadInput) could
+  change it, but attaching to a hung thread risks hanging the attacher, so it was left out.
