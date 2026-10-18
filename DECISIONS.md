@@ -36,3 +36,16 @@
 - **The pointer stays hidden over the stuck game window.** Its display counter belongs to the
   stuck thread. Attaching the watchdog to that thread's input queue (AttachThreadInput) could
   change it, but attaching to a hung thread risks hanging the attacher, so it was left out.
+
+## Reacquire guard (1.0.14)
+
+- **Bundled under `ReleaseMouseOnStall` rather than a new setting.** Without it the release is
+  undone within a second, so the two only make sense together. Alternative: a separate
+  `BlockFocusTheftOnStall`.
+- **Refused calls: the game's mouse Acquire while another window is in front, and
+  SetForegroundWindow / BringWindowToTop on the game window from inside the process.** Only
+  while the player is away from a stall, ending when the game window is genuinely in front
+  with its thread running. Calls the player makes through the shell are never seen.
+- **SetCursorPos is traced, not refused.** Many overlays import it; the probe could not say
+  which module moved the pointer, so the trace names it first. dinput8.dll is the only system
+  DLL whose imports are touched, because it is the prime suspect.

@@ -2841,6 +2841,280 @@ namespace CursorUnbound
 			}
 		}
 
+		// ---------------------------------------------------------------------------
+		// Reacquire guard
+		//
+		// Releasing the mouse during a stall was not enough on its own. "Stuck" here means
+		// the main thread has stopped handling window messages, not that it has stopped: in
+		// a loading screen it keeps running the load and polling input. When its next poll
+		// finds the mouse unacquired it acquires it again, which brings DirectInput's
+		// exclusive-mode thread back - the one that hides the pointer and moves it itself -
+		// and the game window came back to the front with no click from the player. Both
+		// were caught by an outside probe, not inferred.
+		//
+		// So once the player has left a stalled game, the game is refused the mouse while
+		// another window is in front, and refused focus from inside the process, until the
+		// player brings it back. Every refused call, and every pointer move or focus change
+		// made from inside the process while away, is logged with its module and thread so
+		// that whatever is still taking the pointer can be named.
+		// ---------------------------------------------------------------------------
+
+		DWORD             g_mainThreadId = 0;
+		std::atomic<bool> g_awayFromStall{ false };  // the player left while the game was stuck
+		std::atomic<int>  g_awayTraceBudget{ 0 };
+		std::atomic<int>  g_refusedAcquires{ 0 };
+		std::atomic<int>  g_refusedFocus{ 0 };
+
+		using AcquireFn = HRESULT (*)(REX::W32::IDirectInputDevice8A*);
+		AcquireFn g_realAcquire = nullptr;
+		AcquireFn g_realUnacquire = nullptr;
+
+		BOOL(WINAPI* g_realSetForegroundWindow)(HWND) = nullptr;
+		BOOL(WINAPI* g_realBringWindowToTop)(HWND) = nullptr;
+		BOOL(WINAPI* g_realSetCursorPos)(int, int) = nullptr;
+
+		bool GuardActive()
+		{
+			return g_awayFromStall.load(std::memory_order_relaxed) && Config::Get().releaseMouseOnStall;
+		}
+
+		// One trace line while away, out of a budget refilled each time the player leaves.
+		// The game polls every frame, so an unmetered log would be thousands of lines.
+		bool TakeAwayTrace()
+		{
+			const int left = g_awayTraceBudget.fetch_sub(1, std::memory_order_relaxed);
+			if (left == 1) {
+				SKSE::log::info("[stall] Trace budget for this stall spent; further calls are counted, not logged.");
+			}
+			return left > 0;
+		}
+
+		std::string DescribeThread()
+		{
+			const DWORD tid = ::GetCurrentThreadId();
+			return tid == g_mainThreadId ? std::string("main thread") : std::format("thread {}", tid);
+		}
+
+		std::string DescribeCaller(void* a_returnAddress)
+		{
+			return std::format("{} on the {}", ModuleNameForAddress(reinterpret_cast<LONG_PTR>(a_returnAddress)), DescribeThread());
+		}
+
+		// The game's mouse as it is right now, without a reference: only compared against.
+		REX::W32::IDirectInputDevice8A* CurrentGameMouse()
+		{
+			__try {
+				auto* manager = RE::BSInputDeviceManager::GetSingleton();
+				auto* mouse = manager ? manager->GetMouse() : nullptr;
+				return mouse ? mouse->GetRuntimeData().dInputDevice : nullptr;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return nullptr;
+			}
+		}
+
+		bool IsGameWindow(HWND a_hwnd)
+		{
+			return a_hwnd && g_window && (a_hwnd == g_window || ::GetAncestor(a_hwnd, GA_ROOT) == g_window);
+		}
+
+		// The vtable is DirectInput's and shared by every device it creates, keyboard
+		// included, so each call checks it is the game's mouse before doing anything.
+		HRESULT AcquireHook(REX::W32::IDirectInputDevice8A* a_self)
+		{
+			const bool mouse = a_self == CurrentGameMouse();
+			if (mouse && GuardActive() && ::GetForegroundWindow() != g_window) {
+				g_refusedAcquires.fetch_add(1, std::memory_order_relaxed);
+				if (TakeAwayTrace()) {
+					SKSE::log::info(
+						"[stall] Refused the game re-acquiring the mouse while you are away ({}).",
+						DescribeCaller(_ReturnAddress()));
+				}
+				return static_cast<HRESULT>(0x80070005L);  // DIERR_OTHERAPPHASPRIO: what a background window gets
+			}
+			const HRESULT hr = g_realAcquire(a_self);
+			if (mouse && g_awayFromStall.load(std::memory_order_relaxed) && TakeAwayTrace()) {
+				SKSE::log::info(
+					"[stall] Game acquired the mouse while away -> 0x{:08X} ({}, foreground={}).",
+					static_cast<std::uint32_t>(hr),
+					DescribeCaller(_ReturnAddress()),
+					DescribeForegroundWindow());
+			}
+			return hr;
+		}
+
+		HRESULT UnacquireHook(REX::W32::IDirectInputDevice8A* a_self)
+		{
+			const HRESULT hr = g_realUnacquire(a_self);
+			if (a_self == CurrentGameMouse() && g_awayFromStall.load(std::memory_order_relaxed) && TakeAwayTrace()) {
+				SKSE::log::info(
+					"[stall] Mouse unacquired -> 0x{:08X} ({}).",
+					static_cast<std::uint32_t>(hr),
+					DescribeCaller(_ReturnAddress()));
+			}
+			return hr;
+		}
+
+		BOOL WINAPI SetForegroundWindowHook(HWND a_hwnd)
+		{
+			const bool game = IsGameWindow(a_hwnd);
+			if (game && GuardActive()) {
+				g_refusedFocus.fetch_add(1, std::memory_order_relaxed);
+				if (TakeAwayTrace()) {
+					SKSE::log::info(
+						"[stall] Refused SetForegroundWindow(game) while you are away ({}).",
+						DescribeCaller(_ReturnAddress()));
+				}
+				return FALSE;
+			}
+			const BOOL result = g_realSetForegroundWindow ? g_realSetForegroundWindow(a_hwnd) : ::SetForegroundWindow(a_hwnd);
+			if (g_awayFromStall.load(std::memory_order_relaxed) && TakeAwayTrace()) {
+				SKSE::log::info(
+					"[stall] SetForegroundWindow({}) while away -> {} ({}).",
+					game ? "game" : std::format("0x{:X}", reinterpret_cast<std::uintptr_t>(a_hwnd)),
+					result != FALSE,
+					DescribeCaller(_ReturnAddress()));
+			} else {
+				SKSE::log::debug(
+					"SetForegroundWindow({}) -> {} ({}).",
+					game ? "game" : std::format("0x{:X}", reinterpret_cast<std::uintptr_t>(a_hwnd)),
+					result != FALSE,
+					DescribeCaller(_ReturnAddress()));
+			}
+			return result;
+		}
+
+		BOOL WINAPI BringWindowToTopHook(HWND a_hwnd)
+		{
+			const bool game = IsGameWindow(a_hwnd);
+			if (game && GuardActive() && ::GetForegroundWindow() != g_window) {
+				g_refusedFocus.fetch_add(1, std::memory_order_relaxed);
+				if (TakeAwayTrace()) {
+					SKSE::log::info(
+						"[stall] Refused BringWindowToTop(game) while you are away ({}).",
+						DescribeCaller(_ReturnAddress()));
+				}
+				return FALSE;
+			}
+			const BOOL result = g_realBringWindowToTop ? g_realBringWindowToTop(a_hwnd) : ::BringWindowToTop(a_hwnd);
+			if (g_awayFromStall.load(std::memory_order_relaxed) && TakeAwayTrace()) {
+				SKSE::log::info(
+					"[stall] BringWindowToTop({}) while away -> {} ({}).",
+					game ? "game" : std::format("0x{:X}", reinterpret_cast<std::uintptr_t>(a_hwnd)),
+					result != FALSE,
+					DescribeCaller(_ReturnAddress()));
+			}
+			return result;
+		}
+
+		// Traced, never refused: plenty of overlays move the pointer legitimately, and the
+		// point here is to name whoever is still doing it once the mouse is ours again.
+		BOOL WINAPI SetCursorPosHook(int a_x, int a_y)
+		{
+			if (g_awayFromStall.load(std::memory_order_relaxed) && TakeAwayTrace()) {
+				SKSE::log::info(
+					"[stall] SetCursorPos({},{}) while away ({}, foreground={}).",
+					a_x,
+					a_y,
+					DescribeCaller(_ReturnAddress()),
+					DescribeForegroundWindow());
+			}
+			return g_realSetCursorPos ? g_realSetCursorPos(a_x, a_y) : ::SetCursorPos(a_x, a_y);
+		}
+
+		template <class Fn>
+		bool PatchUser32Import(HMODULE a_module, const char* a_function, Fn a_hook, Fn& a_real)
+		{
+			auto* slot = FindImportSlot(a_module, "user32.dll", a_function);
+			if (!slot || *slot == reinterpret_cast<void*>(a_hook)) {
+				return slot != nullptr;
+			}
+			if (!a_real) {
+				a_real = reinterpret_cast<Fn>(*slot);
+			}
+			REL::safe_write(reinterpret_cast<std::uintptr_t>(slot), reinterpret_cast<std::uintptr_t>(a_hook));
+			return true;
+		}
+
+		bool PatchSetForegroundWindowIn(HMODULE a_module)
+		{
+			return PatchUser32Import(a_module, "SetForegroundWindow", &SetForegroundWindowHook, g_realSetForegroundWindow);
+		}
+
+		bool PatchBringWindowToTopIn(HMODULE a_module)
+		{
+			return PatchUser32Import(a_module, "BringWindowToTop", &BringWindowToTopHook, g_realBringWindowToTop);
+		}
+
+		bool PatchSetCursorPosIn(HMODULE a_module)
+		{
+			return PatchUser32Import(a_module, "SetCursorPos", &SetCursorPosHook, g_realSetCursorPos);
+		}
+
+		void InstallReacquireGuard()
+		{
+			const auto& config = Config::Get();
+			if (!config.releaseMouseOnStall) {
+				return;
+			}
+
+			if (config.hookAllModules) {
+				PatchImportsEverywhere("SetForegroundWindow", &PatchSetForegroundWindowIn);
+				PatchImportsEverywhere("BringWindowToTop", &PatchBringWindowToTopIn);
+				PatchImportsEverywhere("SetCursorPos", &PatchSetCursorPosIn);
+			} else {
+				PatchSetForegroundWindowIn(::GetModuleHandleW(nullptr));
+			}
+
+			// DirectInput is a system DLL, which the sweep leaves alone on purpose, but it is
+			// the prime suspect for moving the pointer, so it alone is traced.
+			if (HMODULE dinput = ::GetModuleHandleW(L"dinput8.dll")) {
+				const bool cursorPos = PatchSetCursorPosIn(dinput);
+				const bool foreground = PatchSetForegroundWindowIn(dinput);
+				SKSE::log::info(
+					"Traced dinput8.dll imports (SetCursorPos={}, SetForegroundWindow={}).",
+					cursorPos,
+					foreground);
+			}
+
+			auto* device = AcquireGameMouseRef();
+			if (!device) {
+				SKSE::log::warn("Could not reach the game's mouse device; the reacquire guard is off.");
+				return;
+			}
+			// IUnknown (3) + GetCapabilities, EnumObjects, GetProperty, SetProperty, then
+			// Acquire at 7 and Unacquire at 8.
+			auto** vtable = *reinterpret_cast<void***>(device);
+			if (vtable[7] != reinterpret_cast<void*>(&AcquireHook)) {
+				g_realAcquire = reinterpret_cast<AcquireFn>(vtable[7]);
+				g_realUnacquire = reinterpret_cast<AcquireFn>(vtable[8]);
+				REL::safe_write(reinterpret_cast<std::uintptr_t>(&vtable[7]), reinterpret_cast<std::uintptr_t>(&AcquireHook));
+				REL::safe_write(reinterpret_cast<std::uintptr_t>(&vtable[8]), reinterpret_cast<std::uintptr_t>(&UnacquireHook));
+			}
+			device->Release();
+			SKSE::log::info("Reacquire guard installed on the game's mouse device.");
+		}
+
+		void BeginAwayFromStall()
+		{
+			g_refusedAcquires.store(0, std::memory_order_relaxed);
+			g_refusedFocus.store(0, std::memory_order_relaxed);
+			g_awayTraceBudget.store(60, std::memory_order_relaxed);
+			g_awayFromStall.store(true);
+		}
+
+		// Main thread, when the game window is activated with the thread running again: the
+		// player is back, so the game may have its mouse and focus.
+		void EndAwayFromStall()
+		{
+			if (!g_awayFromStall.exchange(false)) {
+				return;
+			}
+			SKSE::log::info(
+				"[stall] Back in the game. While you were away: refused {} mouse grab(s) and {} focus grab(s).",
+				g_refusedAcquires.load(),
+				g_refusedFocus.load());
+		}
+
 		std::string DescribeClip()
 		{
 			RECT rect{};
@@ -2923,6 +3197,8 @@ namespace CursorUnbound
 
 			if (!a_state.leaving) {
 				a_state.leaving = true;
+				// Before the release below, so a grab-back racing it is already refused.
+				BeginAwayFromStall();
 				SKSE::log::info(
 					"[stall] Leaving while the main thread is stuck ({} ms): {} | foreground={} clip={} "
 					"gameMouse={}",
@@ -2980,6 +3256,7 @@ namespace CursorUnbound
 				return;
 			}
 			::CloseHandle(thread);
+			InstallReacquireGuard();
 			SKSE::log::info(
 				"Stall watchdog started (threshold {} ms, releaseCursor={}, releaseMouse={}, gameMouse={}).",
 				config.stallThresholdMs,
@@ -3041,6 +3318,10 @@ namespace CursorUnbound
 						// Backs up the activation messages, which another subclass in the
 						// chain could swallow.
 						LeaveBackground();
+						if (g_awayFromStall.load(std::memory_order_relaxed)) {
+							EndAwayFromStall();
+							ReacquireGameMouse();
+						}
 						AssertCursorState();
 						AssertCursorHidden();
 						// The game cursor needs the same treatment as the OS one, and for the
@@ -3113,7 +3394,12 @@ namespace CursorUnbound
 						// up.
 						SyncActiveState();
 						LeaveBackground();
-						ReacquireGameMouse();
+						// Only when the window really is in front now. An activation queued up
+						// during a stall can be stale by the time a running thread handles it.
+						if (::GetForegroundWindow() == a_hwnd) {
+							EndAwayFromStall();
+							ReacquireGameMouse();
+						}
 						AssertClip();
 						if (g_active.load(std::memory_order_relaxed)) {
 							AssertCursorState();
@@ -3198,6 +3484,7 @@ namespace CursorUnbound
 			}
 
 			g_windowIsUnicode = ::IsWindowUnicode(hwnd) != FALSE;
+			g_mainThreadId = ::GetWindowThreadProcessId(hwnd, nullptr);
 
 			auto previous = g_windowIsUnicode
 				? ::SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&WndProc))

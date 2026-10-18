@@ -282,7 +282,11 @@ only Ctrl+Alt+Del gets the cursor back.** The cursor lock and the game's hold on
 both let go by the game's main thread when it notices it lost focus, and a thread stuck in a
 load or a freeze notices nothing. From 1.0.13 a watchdog thread spots the game going quiet and,
 if you switch away during it, releases both itself (`ReleaseCursorOnStall`,
-`ReleaseMouseOnStall`). The pointer stays invisible over the stuck game window but works
+`ReleaseMouseOnStall`). In a loading screen the game is busy rather than stopped: it keeps
+polling input, and in 1.0.13 it took the mouse straight back and pulled itself in front again.
+From 1.0.14 `ReleaseMouseOnStall` also refuses the game the mouse and focus until you return
+to it, and logs every refused call and every pointer move made from inside the game while you
+are away. The pointer stays invisible over the stuck game window but works
 everywhere else. Each stall you leave is logged with `[stall]` lines saying what was released;
 if the mouse is dead in game after one, set `ReleaseMouseOnStall = false` and report the log.
 If you alt-tab out of a loading screen and no `[stall]` lines appear, the game was not stuck,
