@@ -132,6 +132,7 @@ See the comments in `CursorUnbound.ini`. The settings most worth knowing:
 | `TrackPartySheetPanels` | Shows the hardware cursor while a Party Sheet panel is open. See below. |
 | `SuppressGridInventoryCursor` | The same, for Grid Inventory's ImGui pointer. Falls back to standing our own cursor down if its signature goes stale. |
 | `SuppressMeridianCursor` | The same, for Meridian UI's present-time cursor sprite. |
+| `SuppressMagelightCursor` | The same, for Magelight UI's cursor sprite. |
 
 Logs go to `Documents\My Games\Skyrim Special Edition\SKSE\CursorUnbound.log`.
 
@@ -139,7 +140,7 @@ Logs go to `Documents\My Games\Skyrim Special Edition\SKSE\CursorUnbound.log`.
 
 Mods that draw their own pointer instead of using the game's cursor menu need explicit
 handling, because their sprite is drawn inside the game frame and so trails the hardware
-cursor. Four are handled:
+cursor. Five are handled:
 
 **PrismaUI** — its cursor sprite is blanked while this plugin is drawing one
 (`SuppressPrismaCursor`). Prisma views drive the cursor menu, so nothing else is needed.
@@ -166,6 +167,27 @@ Nothing extra is needed to make its pages smooth. Taking focus opens a hidden me
 absolute positions. Only the second pointer needed solving, and because Meridian draws it only
 while a page has focus, the suppression follows Prisma's rule and holds for the whole session.
 
+**[Magelight UI](https://www.nexusmods.com/skyrimspecialedition/mods/193303)** — an HTML
+(Ultralight) framework. While one of its pages holds the mouse it keeps the cursor menu open but
+skips its draw, and paints its own sprite at the end of the frame from the same cursor fields
+this plugin writes (`SuppressMagelightCursor`). Its pages are smooth for the same reason
+Meridian's are: holding the mouse pushes a hidden menu that carries `kUsesCursor`.
+
+Magelight needed one thing the others did not. A page can take the gamepad, and when it does
+Magelight removes the pad's events from the input stream before the game's menus see them, then
+moves the cursor itself. The thumbstick hook that normally hands the cursor back to a gamepad
+never fires, so the hardware cursor would sit still while the page's pointer moved. While a
+Magelight page holds the mouse, this plugin therefore reads the pad straight off the device: a
+stick or button press there switches to gamepad mode exactly as a stick in any other menu does,
+which hides the hardware cursor and gives Magelight its own pointer back. Moving the mouse takes
+it back again.
+
+What you give up is Magelight's pointer styling: its cursor glows over buttons, turns into a text
+bar over text and can carry a mod's own art, while the hardware cursor is this plugin's art
+everywhere. `SuppressMagelightCursor = off` keeps Magelight's pointer, with the second, trailing
+one that comes with it. Magelight's own log warns `Windows' own cursor shows over the game` up
+to three times a session; with this plugin that is the hardware cursor doing its job.
+
 **[Grid Inventory](https://www.nexusmods.com/skyrimspecialedition/mods/188733)** — replaces
 the inventory with a Dear ImGui grid, hides the game's Scaleform cursor itself and draws its
 own arrow at the end of its frame (`SuppressGridInventoryCursor`).
@@ -175,8 +197,9 @@ cursor menu itself, so this plugin is already active while it is up and already 
 absolute positions — Grid Inventory reads the same `MenuCursor` fields this plugin writes.
 Only the second pointer needed solving.
 
-That suppression works differently from the other three, and the difference is worth knowing if
-you are updating the signature. Prisma, Party Sheet and Meridian each keep their cursor draw in a
+That suppression works differently from the other four, and the difference is worth knowing if
+you are updating the signature. Prisma, Party Sheet, Meridian and Magelight each keep their cursor
+draw in a
 function of its own, so a `RET` over its first byte is a complete and reversible suppression.
 Grid Inventory's `DrawPointer` is inlined into the function that draws its entire interface —
 there is no function to stub without taking the whole menu with it. What is still reachable is
@@ -188,14 +211,14 @@ also the safer write: four aligned bytes of read-only data, which the render thr
 every frame cannot observe half-applied, where the equivalent code patch would be six bytes
 over a live instruction.
 
-Because that is a data write rather than a code write, it gets one extra check the other three
+Because that is a data write rather than a code write, it gets one extra check the other four
 do not need — the constant must actually hold the value the guard is documented to compare
 against (`-1000.0`) before anything is written. A signature that has drifted onto an unrelated
 constant refuses instead of corrupting it.
 
-None of the four is a dependency. The detection half for Party Sheet is API-based and
+None of the five is a dependency. The detection half for Party Sheet is API-based and
 survives its updates; every suppression half is a signature (verified against **Party Sheet
-3.1**, link stamp `0x6A68DAC1`, **Grid Inventory 1.4.3** and **Meridian UI 1.2.0**) and will
+3.1**, link stamp `0x6A68DAC1`, **Grid Inventory 1.4.3**, **Meridian UI 1.2.0** and **Magelight UI 1.7.1**) and will
 need revisiting when those mods are rebuilt. A stale signature is designed to match nothing: the plugin logs a
 warning, leaves the other mod alone, and you get two pointers rather than a crash. The log
 lines to check are `resolved its cursor-draw function at +0x...`, `resolved its pointer guard

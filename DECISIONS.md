@@ -49,3 +49,23 @@
 - **SetCursorPos is traced, not refused.** Many overlays import it; the probe could not say
   which module moved the pointer, so the trace names it first. dinput8.dll is the only system
   DLL whose imports are touched, because it is the prime suspect.
+
+## Magelight UI (1.0.15)
+
+- **Magelight's pointer is suppressed, as Prisma's and Meridian's are.** The cost is Magelight's
+  pointer styling (a glow over buttons, a text bar over text, mods' own cursor art), which the
+  hardware cursor cannot show because nothing tells this plugin what is under the pointer.
+  Alternative: stand the hardware cursor down on Magelight pages and keep their frame-locked,
+  styled pointer. `SuppressMagelightCursor = off` gets close to that, with two pointers.
+- **The pad is read off the device on the sync timer while Magelight's focus menu is open.** A
+  page that owns the pad unlinks its events before the Cursor Menu's thumbstick hook can see
+  them. Alternative: an input sink prepended ahead of Magelight's, which only works if it
+  registers after Magelight does, so it would depend on plugin load order.
+- **Buttons and triggers switch to gamepad mode there, not only sticks.** In Magelight's
+  navigation mode a D-pad press hides its pointer, and the hardware cursor should go with it.
+  Kept to Magelight pages: elsewhere the thumbstick hook stays the only trigger, so other menus
+  behave as before.
+- **The signature covers EmitCursor's opening guard as well as its prologue.** The prologue is
+  unique on its own but says nothing about what the function is; the guard is the source's own
+  condition for drawing the cursor. It is long (225 bytes) and will need redoing on most
+  Magelight rebuilds, which fails safe.

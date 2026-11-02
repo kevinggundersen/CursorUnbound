@@ -134,6 +134,13 @@ namespace CursorUnbound
 		// focus menu - which carries kUsesCursor and so brings us up. There is no moment it
 		// wants a pointer that we are not covering.
 		CursorSuppression suppressMeridianCursor = CursorSuppression::kAuto;
+		// Magelight UI is an Ultralight (HTML) framework with the same shape of pointer: while
+		// a page holds the mouse it skips the Cursor Menu's draw and paints its own sprite at
+		// the end of the frame from MenuCursor::cursorPosX/Y.
+		//
+		// kAuto follows Meridian's rule: Magelight only draws its pointer while a page holds
+		// the mouse, and holding it pushes a kUsesCursor focus menu that brings us up.
+		CursorSuppression suppressMagelightCursor = CursorSuppression::kAuto;
 		CoordinateSpace coordinateSpace = CoordinateSpace::kAuto;
 		// Manual escape hatch. When > 0 these override whatever the coordinate space
 		// resolution would have picked.

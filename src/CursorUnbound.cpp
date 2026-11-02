@@ -114,6 +114,7 @@ namespace CursorUnbound
 
 		void Activate();
 		void Deactivate();
+		void PollMagelightGamepad();
 
 		// A gamepad drives the menu cursor through ProcessThumbstick, not ProcessMouseMove.
 		// The hardware cursor cannot follow that - the OS pointer simply does not move - so
@@ -1189,6 +1190,110 @@ namespace CursorUnbound
 			0x48, 0x8B, 0x29,
 		};
 
+		// Magelight UI's EmitCursor, from Magelight.dll:
+		//
+		//   84 C9                    test cl, cl                ; anyVisible
+		//   0F 84 ?? ?? ?? ??        je   out
+		//   48 8B C4                 mov  rax, rsp
+		//   48 89 58 08              mov  [rax+8], rbx
+		//   55 56 57 41 54 .. 41 57  push rbp, rsi, rdi, r12-r15
+		//   48 8D A8 ?? ?? ?? ??     lea  rbp, [rax-0x408]
+		//   48 81 EC ?? ?? ?? ??     sub  rsp, 0x4D0
+		//   0F 29 70 B8 .. 44 0F 29 B8 28 FF FF FF
+		//                            movaps [rax-...], xmm6 .. xmm15
+		//   48 8B 05 ?? ?? ?? ??     mov  rax, [rip+__security_cookie]
+		//   48 33 C4                 xor  rax, rsp
+		//   48 89 85 ?? ?? ?? ??     mov  [rbp+0x328], rax
+		//   4C 89 8D ?? ?? ?? ??     mov  [rbp+0xE0], r9        ; emit
+		//   44 0F 28 C2              movaps xmm8, xmm2          ; bh
+		//   F3 44 0F 11 45 ??        movss  [rbp-0x30], xmm8
+		//   0F 28 F9                 movaps xmm7, xmm1          ; bw
+		//   45 33 E4                 xor  r12d, r12d
+		//   44 89 65 ??              mov  [rbp+0x78], r12d
+		//   0F B6 05 ?? ?? ?? ?? 90  movzx eax, [s_focused]
+		//   84 C0 / 0F 84 ?? ?? ?? ??  test al, al / je out
+		//   4C 39 25 ?? ?? ?? ??     cmp  [s_cursorSrv], r12
+		//   0F 84 ?? ?? ?? ??        je   out
+		//   45 0F 57 E4              xorps  xmm12, xmm12
+		//   45 0F 2F C4              comiss xmm8, xmm12         ; bh > 0
+		//   0F 86 ?? ?? ?? ??        jbe  out
+		//   8B 05 ?? ?? ?? ?? 90     mov  eax, [vr state]
+		//   83 F8 02 / 0F 84 ?? ?? ?? ??  cmp eax, 2 / je out   ; VR::IsLive
+		//   0F B6 05 ?? ?? ?? ?? 90  movzx eax, [s_gamepadHidesCursor]
+		//   84 C0 / 0F 85 ?? ?? ?? ??  test al, al / jne out
+		//
+		// Magelight is an Ultralight (HTML) framework with Prisma's shape of pointer. While a
+		// page holds the mouse it pushes a focus menu that carries kUsesCursor, keeps the
+		// Cursor Menu open under it and skips the Cursor Menu's draw, then paints its own
+		// sprite at the end of the frame from MenuCursor::cursorPosX/Y. That inherits our
+		// absolute position and is still frame-locked: a second pointer trailing the first.
+		//
+		// Longer than the other signatures because the prologue alone, while unique, says
+		// nothing about what the function is. The guard chain after it is EmitCursor's own
+		// opening condition read straight out of the source - anyVisible, s_focused, the
+		// cursor texture, a backbuffer height above zero, not live VR, not a navigating pad -
+		// and it is what ties the match to the cursor rather than to any function with ten
+		// saved xmm registers. Locals, displacements and the frame size are wildcarded; the
+		// register allocation is not, and will move with a rebuild. Verified unique across the
+		// whole .text section of Magelight UI 1.7.1 (link stamp 0x6AE5DD38, 2026-10-31, image
+		// 0x2D2000, Nexus 193303), where the function sits at +0x62350. Both of its call sites -
+		// the in-frame composite and the page-thread composite - are calls, not inlined copies,
+		// and nothing else references the cursor's glow and press constants (0.12f, 0.06f) -
+		// which is how to find it again after an update. The source is public
+		// (github.com/Severause/MagelightUI, src/Magelight.cpp).
+		//
+		// Re-check against every new Magelight release. It builds with whole-program
+		// optimisation, so a future build could inline EmitCursor into its callers, which
+		// would turn this into the Grid Inventory situation rather than a merely stale
+		// signature.
+		//
+		// A RET on the first byte is a complete suppression for the same reason it is for
+		// Prisma: EmitCursor returns void, and the RET lands before the frame, the cookie or
+		// any register save. It only emits quads through the callback it is given, so its
+		// callers lose nothing else by it.
+		constexpr int kMagelightEmitCursorSig[] = {
+			0x84, 0xC9,
+			0x0F, 0x84,   -1,   -1,   -1,   -1,
+			0x48, 0x8B, 0xC4,
+			0x48, 0x89, 0x58, 0x08,
+			0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+			0x48, 0x8D, 0xA8,   -1,   -1,   -1,   -1,
+			0x48, 0x81, 0xEC,   -1,   -1,   -1,   -1,
+			0x0F, 0x29, 0x70, 0xB8,
+			0x0F, 0x29, 0x78, 0xA8,
+			0x44, 0x0F, 0x29, 0x40, 0x98,
+			0x44, 0x0F, 0x29, 0x48, 0x88,
+			0x44, 0x0F, 0x29, 0x90, 0x78, 0xFF, 0xFF, 0xFF,
+			0x44, 0x0F, 0x29, 0x98, 0x68, 0xFF, 0xFF, 0xFF,
+			0x44, 0x0F, 0x29, 0xA0, 0x58, 0xFF, 0xFF, 0xFF,
+			0x44, 0x0F, 0x29, 0xA8, 0x48, 0xFF, 0xFF, 0xFF,
+			0x44, 0x0F, 0x29, 0xB0, 0x38, 0xFF, 0xFF, 0xFF,
+			0x44, 0x0F, 0x29, 0xB8, 0x28, 0xFF, 0xFF, 0xFF,
+			0x48, 0x8B, 0x05,   -1,   -1,   -1,   -1,
+			0x48, 0x33, 0xC4,
+			0x48, 0x89, 0x85,   -1,   -1,   -1,   -1,
+			0x4C, 0x89, 0x8D,   -1,   -1,   -1,   -1,
+			0x44, 0x0F, 0x28, 0xC2,
+			0xF3, 0x44, 0x0F, 0x11, 0x45,   -1,
+			0x0F, 0x28, 0xF9,
+			0x45, 0x33, 0xE4,
+			0x44, 0x89, 0x65,   -1,
+			0x0F, 0xB6, 0x05,   -1,   -1,   -1,   -1, 0x90,
+			0x84, 0xC0,
+			0x0F, 0x84,   -1,   -1,   -1,   -1,
+			0x4C, 0x39, 0x25,   -1,   -1,   -1,   -1,
+			0x0F, 0x84,   -1,   -1,   -1,   -1,
+			0x45, 0x0F, 0x57, 0xE4,
+			0x45, 0x0F, 0x2F, 0xC4,
+			0x0F, 0x86,   -1,   -1,   -1,   -1,
+			0x8B, 0x05,   -1,   -1,   -1,   -1, 0x90,
+			0x83, 0xF8, 0x02,
+			0x0F, 0x84,   -1,   -1,   -1,   -1,
+			0x0F, 0xB6, 0x05,   -1,   -1,   -1,   -1, 0x90,
+			0x84, 0xC0,
+			0x0F, 0x85,   -1,   -1,   -1,   -1,
+		};
+
 		CursorStub g_prismaStub{
 			.module = L"PrismaUI.dll",
 			.label = "PrismaUI",
@@ -1225,6 +1330,14 @@ namespace CursorUnbound
 			.noun = "Meridian pages",
 			.signature = kMeridianDrawCursorSig,
 			.signatureLength = std::size(kMeridianDrawCursorSig),
+		};
+
+		CursorStub g_magelightStub{
+			.module = L"Magelight.dll",
+			.label = "Magelight UI",
+			.noun = "Magelight pages",
+			.signature = kMagelightEmitCursorSig,
+			.signatureLength = std::size(kMagelightEmitCursorSig),
 		};
 
 		bool GetTextSection(HMODULE a_module, std::uint8_t*& a_outBegin, std::size_t& a_outSize)
@@ -1598,6 +1711,29 @@ namespace CursorUnbound
 			}
 		}
 
+		bool WantMagelightCursorSuppressed()
+		{
+			const auto& config = Config::Get();
+			switch (config.suppressMagelightCursor) {
+			case CursorSuppression::kOff:
+				return false;
+			case CursorSuppression::kOn:
+				return true;
+			case CursorSuppression::kAuto:
+			default:
+				// Meridian's rule. Magelight draws its pointer only while a page holds the
+				// mouse, and holding it is what pushes its focus menu - kUsesCursor, with the
+				// Cursor Menu pinned open beneath - so every moment it wants a pointer is a
+				// moment we are drawing one. The gamepad gate matters more here than it does
+				// for Meridian: a page that owns the pad takes the stick events before the
+				// Cursor Menu sees them and moves the cursor itself, which only
+				// PollMagelightGamepad notices. Once it has, the sprite comes back and follows
+				// the stick.
+				return config.enabled && config.useHardwareCursor &&
+					   !g_gamepadMode.load(std::memory_order_relaxed);
+			}
+		}
+
 		bool GridInventoryMenuOpen()
 		{
 			auto* ui = RE::UI::GetSingleton();
@@ -1678,6 +1814,11 @@ namespace CursorUnbound
 			SetCursorStubSuppressed(g_meridianStub, WantMeridianCursorSuppressed());
 		}
 
+		void ApplyMagelightCursorPolicy()
+		{
+			SetCursorStubSuppressed(g_magelightStub, WantMagelightCursorSuppressed());
+		}
+
 		// Called wherever any policy's inputs can have changed. All are cheap and idempotent -
 		// SetCursorStubSuppressed early-outs unless the desired state actually differs from the
 		// applied one - so this is safe on the sync timer.
@@ -1687,6 +1828,7 @@ namespace CursorUnbound
 			ApplyPartySheetCursorPolicy();
 			ApplyGridInventoryCursorPolicy();
 			ApplyMeridianCursorPolicy();
+			ApplyMagelightCursorPolicy();
 		}
 
 		// ---------------------------------------------------------------------------
@@ -3322,6 +3464,9 @@ namespace CursorUnbound
 							EndAwayFromStall();
 							ReacquireGameMouse();
 						}
+						// Ahead of the assertions, so a switch to the pad it picks up this
+						// tick is not first undone by them.
+						PollMagelightGamepad();
 						AssertCursorState();
 						AssertCursorHidden();
 						// The game cursor needs the same treatment as the OS one, and for the
@@ -3756,6 +3901,93 @@ namespace CursorUnbound
 		};
 
 		// ---------------------------------------------------------------------------
+		// Magelight UI gamepad detection
+		//
+		// ProcessThumbstickHook cannot see a gamepad that a Magelight page owns. Magelight
+		// prepends its own input sink ahead of MenuControls and unlinks every pad event its
+		// page consumes, so the Cursor Menu never receives the stick. In cursor mode the page
+		// then moves MenuCursor itself; in navigation mode it hides its pointer. Either way
+		// the hardware cursor would stay where the mouse left it - on top of a pointer that
+		// moved, or with no pointer of Magelight's left to stand in for.
+		//
+		// So while Magelight's focus menu is open, the pad is read straight off the device on
+		// the sync timer. Not through a sink of our own: sinks run in registration order, and
+		// getting ahead of Magelight's would depend on which plugin registers last. The game
+		// writes the device state in its poll, before any sink runs, so this read is
+		// order-free.
+		//
+		// Gated on Magelight's focus menu rather than on any menu. In other menus the stick
+		// still reaches the Cursor Menu and the hook above, and treating a pad button press
+		// as a switch to the pad would be a change to every menu in the game.
+		// ---------------------------------------------------------------------------
+
+		// The previous poll's buttons, for press edges. A held button is no evidence of
+		// anything once a mouse move has already taken the cursor back.
+		std::uint16_t g_lastMagelightPadButtons = 0;
+
+		bool MagelightPageHoldsMouse()
+		{
+			auto* ui = RE::UI::GetSingleton();
+			if (!ui) {
+				return false;
+			}
+			// Constructed once, for the same reason as GridInventoryMenuOpen's.
+			static const RE::BSFixedString name{ "MagelightFocus" };
+			return ui->IsMenuOpen(name);
+		}
+
+		// Not gated on the cursor stub having resolved. With a stale signature both pointers are
+		// on screen, and the hardware one still has to get out of the way of a pad-driven one.
+		void PollMagelightGamepad()
+		{
+			if (!g_runtimeReady.load(std::memory_order_relaxed) ||
+				!g_active.load(std::memory_order_relaxed) ||
+				!MagelightPageHoldsMouse()) {
+				g_lastMagelightPadButtons = 0;
+				return;
+			}
+
+			auto* devices = RE::BSInputDeviceManager::GetSingleton();
+			if (!devices || !devices->IsGamepadEnabled()) {
+				return;
+			}
+			auto* pad = skyrim_cast<RE::BSWin32GamepadDevice*>(devices->GetGamepad());
+			if (!pad) {
+				return;
+			}
+
+			const auto& state = pad->GetRuntimeData().currentState.gamepad;
+
+			// The same deadzone as ProcessThumbstickHook, on the raw axes it is normalised
+			// from, and both sticks as there: Magelight scrolls with the right one.
+			constexpr float kDeadzone = 0.2f;
+			const auto past = [](std::int16_t a_axis) {
+				return std::fabs(static_cast<float>(a_axis) / 32767.0f) > kDeadzone;
+			};
+			const bool stick = past(state.thumbLX) || past(state.thumbLY) ||
+							   past(state.thumbRX) || past(state.thumbRY);
+
+			// Triggers folded in as the two bits XInput leaves unused, so they press like the
+			// buttons they are to Magelight's router.
+			std::uint16_t buttons = state.buttons & REX::W32::XINPUT_GAMEPAD_BUTTON_MASK;
+			if (state.leftTrigger > 128) {
+				buttons |= 0x0400;
+			}
+			if (state.rightTrigger > 128) {
+				buttons |= 0x0800;
+			}
+			// Tracked through gamepad mode as well, so a button still held when the mouse takes
+			// the cursor back is not read as a fresh press on the next tick.
+			const bool pressed = (buttons & ~g_lastMagelightPadButtons) != 0;
+			g_lastMagelightPadButtons = buttons;
+
+			if ((stick || pressed) && !g_gamepadMode.load(std::memory_order_relaxed)) {
+				SKSE::log::info("Gamepad input while a Magelight page holds the mouse.");
+				EnterGamepadMode();
+			}
+		}
+
+		// ---------------------------------------------------------------------------
 		// CursorMenu::ProcessMouseMove detour
 		// ---------------------------------------------------------------------------
 
@@ -3919,6 +4151,7 @@ namespace CursorUnbound
 		ResolveCursorStub(g_partySheetStub);
 		ResolveCursorStub(g_gridInventoryStub);
 		ResolveCursorStub(g_meridianStub);
+		ResolveCursorStub(g_magelightStub);
 		ApplyCursorSuppressionPolicies();
 
 		g_runtimeReady.store(true);
@@ -3939,6 +4172,7 @@ namespace CursorUnbound
 		SetCursorStubSuppressed(g_partySheetStub, false);
 		SetCursorStubSuppressed(g_gridInventoryStub, false);
 		SetCursorStubSuppressed(g_meridianStub, false);
+		SetCursorStubSuppressed(g_magelightStub, false);
 
 		if (g_window && ::IsWindow(g_window)) {
 			::KillTimer(g_window, kSyncTimerId);

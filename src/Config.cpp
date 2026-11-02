@@ -201,6 +201,8 @@ namespace CursorUnbound
 					suppressGridInventoryCursor = ParseSuppression(value);
 				} else if (key == "suppressmeridiancursor") {
 					suppressMeridianCursor = ParseSuppression(value);
+				} else if (key == "suppressmagelightcursor") {
+					suppressMagelightCursor = ParseSuppression(value);
 				} else if (key == "coordinatespace") {
 					const auto v = ToLower(value);
 					if (v == "game") {
