@@ -69,3 +69,26 @@
   unique on its own but says nothing about what the function is; the guard is the source's own
   condition for drawing the cursor. It is long (225 bytes) and will need redoing on most
   Magelight rebuilds, which fails safe.
+
+## ENB editor (1.0.16)
+
+- **ENB's arrow wins while its editor is open; this plugin stands aside.** Both were setting the
+  one hardware pointer, so it alternated between the two images every frame. Alternative: patch
+  ENB's `SetCursor` import and swallow its calls while this plugin owns the pointer, which keeps
+  this plugin's art over the editor but overrides ENB's own pointer handling and depends on how
+  ENB sets it.
+- **Standing aside means hiding the hardware pointer, not only leaving its image to ENB.** The
+  editor draws its own arrow as well as setting the hardware one, so leaving the hardware pointer
+  visible still showed two arrows moving together. In vanilla menus the game keeps the hardware
+  pointer hidden and the editor's drawn arrow is the one you use, so hiding it matches that.
+- **The editor state comes from ENB's `ENBGetState` export (state 1), looked up at runtime in
+  `d3d11.dll`.** It is ENB's SDK interface for other mods, so ENB stays optional and nothing is
+  matched by signature. State 1 was checked against the 0.504 disassembly (`return flag == 1`)
+  rather than an SDK header.
+- **The game's Scaleform pointer stays hidden under the editor.** Bringing it back would be a
+  second pointer next to ENB's. Outside menus nothing changes: the game and the 4 Hz re-hide
+  already keep the hardware pointer hidden.
+- **`WM_SETCURSOR` is still answered under the editor, without setting an image.** Falling
+  through to DefWindowProc would hand the image back to the window class for no gain.
+- **On by default (`YieldToENBEditor`).** The flicker is the only alternative with ENB installed,
+  and without ENB the setting does nothing.

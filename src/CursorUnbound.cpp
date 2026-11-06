@@ -132,6 +132,43 @@ namespace CursorUnbound
 		// pointer of our own on top of theirs.
 		std::atomic<bool> g_yieldPointer{ false };
 
+		// ENB's editor (Shift+Enter by default) draws its own arrow, and also sets the hardware
+		// pointer to an arrow with USER32!SetCursor on every frame it is open. Our assertions
+		// set our art back on the 15 ms sync timer, so with a menu open the hardware pointer
+		// flickered between the two images. Leaving the image to ENB stopped that but still
+		// showed two pointers, ENB's drawn arrow and the hardware one, because in menus we keep
+		// the hardware pointer visible where the game would have hidden it. So while the
+		// editor is open we hide the hardware pointer, as the game does, and ENB's own arrow is
+		// the only one on screen.
+		//
+		// ENBGetState is ENB's own SDK export, resolved at runtime so ENB stays optional.
+		// State 1 is ENBState_IsEditorActive; in 0.504 it is a plain `return flag == 1`, so
+		// the result is exactly 0 or 1.
+		using ENBGetStateFn = long(WINAPI*)(long);
+		ENBGetStateFn     g_enbGetState = nullptr;
+		constexpr long    kENBStateIsEditorActive = 1;
+		std::atomic<bool> g_enbEditorOpen{ false };
+
+		// Live read, so a frame where the editor has just opened is already handed over.
+		// Transitions are logged once each; callers run on more than one thread, hence the
+		// exchange.
+		bool ENBEditorOpen()
+		{
+			if (!g_enbGetState) {
+				return false;
+			}
+
+			const bool open = g_enbGetState(kENBStateIsEditorActive) != 0;
+			if (g_enbEditorOpen.exchange(open, std::memory_order_relaxed) != open) {
+				if (open) {
+					SKSE::log::info("ENB editor opened; leaving the pointer to ENB until it closes.");
+				} else {
+					SKSE::log::info("ENB editor closed; taking the pointer back.");
+				}
+			}
+			return open;
+		}
+
 		struct Diagnostics
 		{
 			std::uint64_t activations = 0;
@@ -2740,6 +2777,11 @@ namespace CursorUnbound
 				return;
 			}
 
+			// The ENB editor draws its own arrow; a visible hardware pointer would be a second.
+			if (ENBEditorOpen()) {
+				ForceCursorHidden();
+				return;
+			}
 			ForceCursorShown();
 			if (HCURSOR cursor = g_customCursor ? g_customCursor : g_fallbackCursor) {
 				::SetCursor(cursor);
@@ -3515,6 +3557,13 @@ namespace CursorUnbound
 				if (g_active.load(std::memory_order_relaxed) && Config::Get().useHardwareCursor &&
 					!g_gamepadMode.load(std::memory_order_relaxed) &&
 					!g_yieldPointer.load(std::memory_order_relaxed) && LOWORD(a_lparam) == HTCLIENT) {
+					// Still answered under the ENB editor, but with the hardware pointer hidden:
+					// ENB draws its own arrow there.
+					if (ENBEditorOpen()) {
+						ForceCursorHidden();
+						++g_stats.wmSetCursorAnswered;
+						return TRUE;
+					}
 					HCURSOR cursor = g_customCursor ? g_customCursor : g_fallbackCursor;
 					if (!cursor) {
 						// Never pass null here - that would hide the pointer entirely.
@@ -3768,7 +3817,9 @@ namespace CursorUnbound
 				// yielding to hides it itself, and putting it back here would be a third pointer
 				// on screen. Only the showing of ours is skipped; AssertCursorHidden takes the
 				// OS cursor back down from here.
-				if (!yielded) {
+				if (ENBEditorOpen()) {
+					ForceCursorHidden();
+				} else if (!yielded) {
 					ForceCursorShown();
 					::SetCursor(g_customCursor ? g_customCursor : g_fallbackCursor);
 				}
@@ -3877,8 +3928,12 @@ namespace CursorUnbound
 				if (config.hideGameCursor) {
 					SetScaleformCursorVisible(false, false);
 				}
-				ForceCursorShown();
-				::SetCursor(g_customCursor ? g_customCursor : g_fallbackCursor);
+				if (ENBEditorOpen()) {
+					ForceCursorHidden();
+				} else {
+					ForceCursorShown();
+					::SetCursor(g_customCursor ? g_customCursor : g_fallbackCursor);
+				}
 			}
 		}
 
@@ -4089,6 +4144,43 @@ namespace CursorUnbound
 		};
 	}
 
+	namespace
+	{
+		// ENB for SE only ever ships as the game-folder d3d11.dll, which the loader picks over
+		// the system one. The system DLL exports none of the ENB* functions, so their absence
+		// is the "no ENB" answer rather than an error.
+		void ResolveENB()
+		{
+			HMODULE d3d11 = ::GetModuleHandleW(L"d3d11.dll");
+			auto*   getState = d3d11 ? ::GetProcAddress(d3d11, "ENBGetState") : nullptr;
+			if (!getState) {
+				SKSE::log::info("ENB is not loaded; nothing to do about its editor.");
+				return;
+			}
+
+			using ENBGetLongFn = long(WINAPI*)();
+			auto* getVersion = reinterpret_cast<ENBGetLongFn>(::GetProcAddress(d3d11, "ENBGetVersion"));
+			auto* getSdkVersion = reinterpret_cast<ENBGetLongFn>(::GetProcAddress(d3d11, "ENBGetSDKVersion"));
+			const long version = getVersion ? getVersion() : 0;
+			const long sdkVersion = getSdkVersion ? getSdkVersion() : 0;
+
+			if (!Config::Get().yieldToENBEditor) {
+				SKSE::log::info(
+					"ENB {} (SDK {}) is loaded, but YieldToENBEditor is off; its editor and this "
+					"plugin will both set the pointer.",
+					version,
+					sdkVersion);
+				return;
+			}
+
+			g_enbGetState = reinterpret_cast<ENBGetStateFn>(getState);
+			SKSE::log::info(
+				"ENB {} (SDK {}) is loaded; the pointer is left to ENB while its editor is open.",
+				version,
+				sdkVersion);
+		}
+	}
+
 	void InstallHooks()
 	{
 		REL::Relocation<std::uintptr_t> vtable{ RE::VTABLE_CursorMenu[1] };
@@ -4153,6 +4245,7 @@ namespace CursorUnbound
 		ResolveCursorStub(g_meridianStub);
 		ResolveCursorStub(g_magelightStub);
 		ApplyCursorSuppressionPolicies();
+		ResolveENB();
 
 		g_runtimeReady.store(true);
 

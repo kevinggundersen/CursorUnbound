@@ -133,6 +133,7 @@ See the comments in `CursorUnbound.ini`. The settings most worth knowing:
 | `SuppressGridInventoryCursor` | The same, for Grid Inventory's ImGui pointer. Falls back to standing our own cursor down if its signature goes stale. |
 | `SuppressMeridianCursor` | The same, for Meridian UI's present-time cursor sprite. |
 | `SuppressMagelightCursor` | The same, for Magelight UI's cursor sprite. |
+| `YieldToENBEditor` | Leaves the pointer to ENB while its editor is open. See below. |
 
 Logs go to `Documents\My Games\Skyrim Special Edition\SKSE\CursorUnbound.log`.
 
@@ -229,6 +230,21 @@ an inlined function. If it fails to resolve, this plugin stands its *own* hardwa
 while the grid is open rather than leaving two on screen. You get one pointer, drawn by Grid
 Inventory at the game's frame rate — still correctly positioned, just not smooth, and only
 inside the grid. The log says `the hardware cursor is standing down` when that happens.
+
+### ENB's editor
+
+ENB's editor (Shift+Enter) is a different case. It draws its own arrow, and it also sets the
+Windows pointer to an arrow on every frame it is open. This plugin sets that same Windows pointer
+to its cursor art while a menu is open, and with both of them setting it, the pointer flickered
+between the two images every frame, next to ENB's drawn arrow. Without this plugin you get two
+pointers there instead: the game's sprite and ENB's arrow.
+
+So while the editor is open, this plugin hides the Windows pointer, as the game would
+(`YieldToENBEditor`). The game's sprite stays hidden too, so ENB's arrow is the only pointer on
+screen, and this plugin's cursor comes back when the editor closes. The plugin asks ENB itself
+whether the editor is open, through the `ENBGetState` function ENB exports for other mods.
+Without ENB installed this does nothing. The log says `ENB ... is loaded` at startup, and `ENB
+editor opened` and `closed` as you toggle it.
 
 ## Troubleshooting
 

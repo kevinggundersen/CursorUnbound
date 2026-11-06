@@ -203,6 +203,8 @@ namespace CursorUnbound
 					suppressMeridianCursor = ParseSuppression(value);
 				} else if (key == "suppressmagelightcursor") {
 					suppressMagelightCursor = ParseSuppression(value);
+				} else if (key == "yieldtoenbeditor") {
+					yieldToENBEditor = ParseBool(value, yieldToENBEditor);
 				} else if (key == "coordinatespace") {
 					const auto v = ToLower(value);
 					if (v == "game") {

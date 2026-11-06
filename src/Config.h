@@ -141,6 +141,11 @@ namespace CursorUnbound
 		// kAuto follows Meridian's rule: Magelight only draws its pointer while a page holds
 		// the mouse, and holding it pushes a kUsesCursor focus menu that brings us up.
 		CursorSuppression suppressMagelightCursor = CursorSuppression::kAuto;
+		// ENB's editor draws its own arrow and sets the hardware pointer's image every frame it
+		// is open. Both of us setting that image made the pointer alternate between the two
+		// frame by frame. While the editor is open, hide the hardware pointer, as the game
+		// would, so ENB's own arrow is the only one on screen.
+		bool              yieldToENBEditor = true;
 		CoordinateSpace coordinateSpace = CoordinateSpace::kAuto;
 		// Manual escape hatch. When > 0 these override whatever the coordinate space
 		// resolution would have picked.
