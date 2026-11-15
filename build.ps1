@@ -1,7 +1,7 @@
 # Configures and builds Cursor Unbound, then optionally deploys it to a mod folder.
 #
 #   powershell -ExecutionPolicy Bypass -File build.ps1
-#   powershell -ExecutionPolicy Bypass -File build.ps1 -ModDir "E:\MO2 Mods\Cursor Unbound"
+#   powershell -ExecutionPolicy Bypass -File build.ps1 -ModDir "F:\MO2 Mods\Cursor Unbound"
 #
 # vcpkg is located via -VcpkgRoot, then $env:VCPKG_ROOT, then a few common paths.
 # CMake is located via PATH, then the copy bundled with Visual Studio 2022.
