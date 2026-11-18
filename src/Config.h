@@ -141,6 +141,19 @@ namespace CursorUnbound
 		// kAuto follows Meridian's rule: Magelight only draws its pointer while a page holds
 		// the mouse, and holding it pushes a kUsesCursor focus menu that brings us up.
 		CursorSuppression suppressMagelightCursor = CursorSuppression::kAuto;
+		// Custom Markers hides the Cursor Menu on the world map and draws its own arrow with
+		// Dear ImGui at the end of its frame, from MenuCursor::cursorPosX/Y on the map and from
+		// the OS cursor over its settings panel - frame-locked either way, so alongside the
+		// hardware cursor it reads as a second pointer trailing the first.
+		//
+		// kAuto is gated on us being active, like Party Sheet: the same arrow serves the
+		// settings panel during gameplay, which only brings us up when the panel tracking
+		// below has resolved, and the map opens a frame or two before its Cursor Menu does.
+		CursorSuppression suppressCustomMarkersCursor = CursorSuppression::kAuto;
+		// Treat Custom Markers' settings panel (LShift+X) as a reason to show the hardware
+		// cursor. The panel is Custom Markers' own ImGui window, not a game menu, so nothing
+		// else can tell that it is open. Its visibility flag is located by signature.
+		bool              trackCustomMarkersPanel = true;
 		// ENB's editor draws its own arrow and sets the hardware pointer's image every frame it
 		// is open. Both of us setting that image made the pointer alternate between the two
 		// frame by frame. While the editor is open, hide the hardware pointer, as the game

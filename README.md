@@ -133,6 +133,8 @@ See the comments in `CursorUnbound.ini`. The settings most worth knowing:
 | `SuppressGridInventoryCursor` | The same, for Grid Inventory's ImGui pointer. Falls back to standing our own cursor down if its signature goes stale. |
 | `SuppressMeridianCursor` | The same, for Meridian UI's present-time cursor sprite. |
 | `SuppressMagelightCursor` | The same, for Magelight UI's cursor sprite. |
+| `SuppressCustomMarkersCursor` | The same, for Custom Markers' world map and settings panel arrow. |
+| `TrackCustomMarkersPanel` | Shows the hardware cursor while Custom Markers' settings panel is open. See below. |
 | `YieldToENBEditor` | Leaves the pointer to ENB while its editor is open. See below. |
 
 Logs go to `Documents\My Games\Skyrim Special Edition\SKSE\CursorUnbound.log`.
@@ -141,7 +143,7 @@ Logs go to `Documents\My Games\Skyrim Special Edition\SKSE\CursorUnbound.log`.
 
 Mods that draw their own pointer instead of using the game's cursor menu need explicit
 handling, because their sprite is drawn inside the game frame and so trails the hardware
-cursor. Five are handled:
+cursor. Six are handled:
 
 **PrismaUI** — its cursor sprite is blanked while this plugin is drawing one
 (`SuppressPrismaCursor`). Prisma views drive the cursor menu, so nothing else is needed.
@@ -189,6 +191,20 @@ everywhere. `SuppressMagelightCursor = off` keeps Magelight's pointer, with the 
 one that comes with it. Magelight's own log warns `Windows' own cursor shows over the game` up
 to three times a session; with this plugin that is the hardware cursor doing its job.
 
+**[Custom Markers](https://www.nexusmods.com/skyrimspecialedition/mods/191027)** — hides the
+game's cursor on the world map and draws its own arrow with Dear ImGui at the end of the frame,
+from the same cursor fields this plugin writes (`SuppressCustomMarkersCursor`). The map is smooth
+without anything extra: it opens the cursor menu, so this plugin is already active there, and
+Custom Markers only stops that menu drawing.
+
+Its settings panel (LShift+X) is the Party Sheet case: an ImGui window of its own rather than a
+game menu, drawing the same arrow from the OS cursor. Custom Markers announces nothing about it,
+so this plugin reads the panel's visibility flag out of Custom Markers, located by signature
+(`TrackCustomMarkersPanel`). While the panel is open the hardware cursor comes up and the arrow is
+suppressed, as for a Party Sheet panel. As with Party Sheet, the suppression only holds while this
+plugin is active, so if the panel tracking is off or its signature goes stale, the panel keeps
+Custom Markers' arrow rather than losing its pointer.
+
 **[Grid Inventory](https://www.nexusmods.com/skyrimspecialedition/mods/188733)** — replaces
 the inventory with a Dear ImGui grid, hides the game's Scaleform cursor itself and draws its
 own arrow at the end of its frame (`SuppressGridInventoryCursor`).
@@ -198,9 +214,9 @@ cursor menu itself, so this plugin is already active while it is up and already 
 absolute positions — Grid Inventory reads the same `MenuCursor` fields this plugin writes.
 Only the second pointer needed solving.
 
-That suppression works differently from the other four, and the difference is worth knowing if
-you are updating the signature. Prisma, Party Sheet, Meridian and Magelight each keep their cursor
-draw in a
+That suppression works differently from the other five, and the difference is worth knowing if
+you are updating the signature. Prisma, Party Sheet, Meridian, Magelight and Custom Markers each
+keep their cursor draw in a
 function of its own, so a `RET` over its first byte is a complete and reversible suppression.
 Grid Inventory's `DrawPointer` is inlined into the function that draws its entire interface —
 there is no function to stub without taking the whole menu with it. What is still reachable is
@@ -212,18 +228,20 @@ also the safer write: four aligned bytes of read-only data, which the render thr
 every frame cannot observe half-applied, where the equivalent code patch would be six bytes
 over a live instruction.
 
-Because that is a data write rather than a code write, it gets one extra check the other four
+Because that is a data write rather than a code write, it gets one extra check the other five
 do not need — the constant must actually hold the value the guard is documented to compare
 against (`-1000.0`) before anything is written. A signature that has drifted onto an unrelated
 constant refuses instead of corrupting it.
 
-None of the five is a dependency. The detection half for Party Sheet is API-based and
+None of the six is a dependency. The detection half for Party Sheet is API-based and
 survives its updates; every suppression half is a signature (verified against **Party Sheet
-3.1**, link stamp `0x6A68DAC1`, **Grid Inventory 1.4.3**, **Meridian UI 1.2.0** and **Magelight UI 1.7.1**) and will
-need revisiting when those mods are rebuilt. A stale signature is designed to match nothing: the plugin logs a
-warning, leaves the other mod alone, and you get two pointers rather than a crash. The log
-lines to check are `resolved its cursor-draw function at +0x...`, `resolved its pointer guard
-at +0x...` and `cursor suppressed`.
+3.1**, link stamp `0x6A68DAC1`, **Grid Inventory 1.4.3**, **Meridian UI 1.2.0**, **Magelight UI
+1.7.1** and **Custom Markers 1.3.4**, link stamp `0x6AF1DCF8`) and will need revisiting when those
+mods are rebuilt, as will the detection half for Custom Markers' settings panel. A stale
+signature is designed to match nothing: the plugin logs a warning, leaves the other mod alone,
+and you get two pointers rather than a crash. The log lines to check are `resolved its
+cursor-draw function at +0x...`, `resolved its pointer guard at +0x...`, `resolved its settings
+panel's visibility flag at +0x...` and `cursor suppressed`.
 
 Grid Inventory has one more layer, because it is updated often and its signature sits inside
 an inlined function. If it fails to resolve, this plugin stands its *own* hardware cursor down

@@ -203,6 +203,10 @@ namespace CursorUnbound
 					suppressMeridianCursor = ParseSuppression(value);
 				} else if (key == "suppressmagelightcursor") {
 					suppressMagelightCursor = ParseSuppression(value);
+				} else if (key == "suppresscustommarkerscursor") {
+					suppressCustomMarkersCursor = ParseSuppression(value);
+				} else if (key == "trackcustommarkerspanel") {
+					trackCustomMarkersPanel = ParseBool(value, trackCustomMarkersPanel);
 				} else if (key == "yieldtoenbeditor") {
 					yieldToENBEditor = ParseBool(value, yieldToENBEditor);
 				} else if (key == "coordinatespace") {

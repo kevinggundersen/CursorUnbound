@@ -1331,6 +1331,82 @@ namespace CursorUnbound
 			0x0F, 0x85,   -1,   -1,   -1,   -1,
 		};
 
+		// Custom Markers' MapDraw::DrawCursor(ImDrawList*, float mx, float my), from
+		// CustomMarkers.dll:
+		//
+		//   48 8B C4                 mov  rax, rsp
+		//   48 89 58 10 .. 78 20     mov  [rax+0x10..0x20], rbx, rsi, rdi
+		//   55                       push rbp
+		//   48 8D 68 ??              lea  rbp, [rax-0x5F]
+		//   48 81 EC ?? ?? ?? ??     sub  rsp, 0x100
+		//   0F 29 70 ?? .. 44 0F 29 48 ??
+		//                            movaps [rax-...], xmm6 .. xmm9
+		//   48 8B 05 ?? ?? ?? ??     mov  rax, [rip+__security_cookie]
+		//   48 33 C4                 xor  rax, rsp
+		//   48 89 45 ??              mov  [rbp+0x0F], rax
+		//   0F 28 FA                 movaps xmm7, xmm2          ; my
+		//   44 0F 28 C1              movaps xmm8, xmm1          ; mx
+		//   48 8B F1                 mov  rsi, rcx              ; dl
+		//   8B 0D ?? ?? ?? ??        mov  ecx, [_tls_index]
+		//   65 48 8B 04 25 58 00 00 00  mov rax, gs:[0x58]
+		//   BA ?? ?? ?? ??           mov  edx, 0xD0
+		//   48 8B 04 C8 / 8B 0C 02   ; thread-local init epoch
+		//   39 0D ?? ?? ?? ??        cmp  [s_cursorSrv guard], ecx
+		//   0F 8F ?? ?? ?? ??        jg   first-call init of s_cursorSrv
+		//   E8 ?? ?? ?? ??           call ImGui::GetIO
+		//   F3 0F 10 70 0C           movss xmm6, [rax+0xC]      ; io.DisplaySize.y
+		//
+		// Custom Markers hides the Cursor Menu itself while the world map is open and draws
+		// this arrow in its place, at the end of its ImGui frame from MenuCursor::cursorPosX/Y.
+		// That inherits our absolute position and is still frame-locked: a second pointer
+		// trailing the first. Its settings panel (LShift+X) draws the same arrow from the OS
+		// cursor, through the same function.
+		//
+		// What ties the match to this function rather than to any 0x100-frame prologue is the
+		// argument shuffle (two floats and a pointer, in that order), the thread-safe guard for
+		// its function-local texture static, and the read of io.DisplaySize.y it scales the
+		// arrow by. Verified unique across the whole .text section of Custom Markers 1.3.4
+		// (link stamp 0x6AF1DCF8, image 0x47A000, Nexus 191027), where the function sits at
+		// +0x8B3D0. It is the only function that builds the path
+		// "Data\Interface\CustomMarkers\Icons\cursor.png" (as SSE stores, not a lea), and it
+		// has one call site, at the end of the present hook's frame - which is how to find it
+		// again after an update. The source is public (github.com/rijosan87/CustomMarkers,
+		// include/MapDrawHelpers.h). Re-check against every new Custom Markers release.
+		//
+		// A RET on the first byte is a complete suppression for the same reason it is for
+		// Prisma: DrawCursor returns void, and the RET lands before the frame, the cookie or
+		// any register save. It only adds the arrow to the foreground draw list, so the frame
+		// loses nothing else - and it covers the hand-drawn fallback arrow too, which a blank
+		// cursor.png does not.
+		constexpr int kCustomMarkersDrawCursorSig[] = {
+			0x48, 0x8B, 0xC4,
+			0x48, 0x89, 0x58, 0x10,
+			0x48, 0x89, 0x70, 0x18,
+			0x48, 0x89, 0x78, 0x20,
+			0x55,
+			0x48, 0x8D, 0x68,   -1,
+			0x48, 0x81, 0xEC,   -1,   -1,   -1,   -1,
+			0x0F, 0x29, 0x70,   -1,
+			0x0F, 0x29, 0x78,   -1,
+			0x44, 0x0F, 0x29, 0x40,   -1,
+			0x44, 0x0F, 0x29, 0x48,   -1,
+			0x48, 0x8B, 0x05,   -1,   -1,   -1,   -1,
+			0x48, 0x33, 0xC4,
+			0x48, 0x89, 0x45,   -1,
+			0x0F, 0x28, 0xFA,
+			0x44, 0x0F, 0x28, 0xC1,
+			0x48, 0x8B, 0xF1,
+			0x8B, 0x0D,   -1,   -1,   -1,   -1,
+			0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0x00, 0x00, 0x00,
+			0xBA,   -1,   -1,   -1,   -1,
+			0x48, 0x8B, 0x04, 0xC8,
+			0x8B, 0x0C, 0x02,
+			0x39, 0x0D,   -1,   -1,   -1,   -1,
+			0x0F, 0x8F,   -1,   -1,   -1,   -1,
+			0xE8,   -1,   -1,   -1,   -1,
+			0xF3, 0x0F, 0x10, 0x70, 0x0C,
+		};
+
 		CursorStub g_prismaStub{
 			.module = L"PrismaUI.dll",
 			.label = "PrismaUI",
@@ -1375,6 +1451,14 @@ namespace CursorUnbound
 			.noun = "Magelight pages",
 			.signature = kMagelightEmitCursorSig,
 			.signatureLength = std::size(kMagelightEmitCursorSig),
+		};
+
+		CursorStub g_customMarkersStub{
+			.module = L"CustomMarkers.dll",
+			.label = "Custom Markers",
+			.noun = "the world map and Custom Markers' settings panel",
+			.signature = kCustomMarkersDrawCursorSig,
+			.signatureLength = std::size(kCustomMarkersDrawCursorSig),
 		};
 
 		bool GetTextSection(HMODULE a_module, std::uint8_t*& a_outBegin, std::size_t& a_outSize)
@@ -1771,6 +1855,30 @@ namespace CursorUnbound
 			}
 		}
 
+		bool WantCustomMarkersCursorSuppressed()
+		{
+			const auto& config = Config::Get();
+			switch (config.suppressCustomMarkersCursor) {
+			case CursorSuppression::kOff:
+				return false;
+			case CursorSuppression::kOn:
+				return true;
+			case CursorSuppression::kAuto:
+			default:
+				// Party Sheet's rule, for its reason. The same arrow serves the settings panel
+				// during gameplay, which is not a menu and brings us up only through
+				// CustomMarkersPanelWantsCursor - so with that turned off or unresolved,
+				// suppressing for the whole session would leave the panel with no pointer.
+				// The map is covered either way: its Cursor Menu brings us up, a frame or two
+				// after Custom Markers has started drawing. And as everywhere else, a gamepad
+				// keeps Custom Markers' arrow: it hides the game's cursor on the map, so on a
+				// pad that arrow is the only pointer there.
+				return config.enabled && config.useHardwareCursor &&
+					   !g_gamepadMode.load(std::memory_order_relaxed) &&
+					   g_active.load(std::memory_order_relaxed);
+			}
+		}
+
 		bool GridInventoryMenuOpen()
 		{
 			auto* ui = RE::UI::GetSingleton();
@@ -1856,6 +1964,11 @@ namespace CursorUnbound
 			SetCursorStubSuppressed(g_magelightStub, WantMagelightCursorSuppressed());
 		}
 
+		void ApplyCustomMarkersCursorPolicy()
+		{
+			SetCursorStubSuppressed(g_customMarkersStub, WantCustomMarkersCursorSuppressed());
+		}
+
 		// Called wherever any policy's inputs can have changed. All are cheap and idempotent -
 		// SetCursorStubSuppressed early-outs unless the desired state actually differs from the
 		// applied one - so this is safe on the sync timer.
@@ -1866,6 +1979,7 @@ namespace CursorUnbound
 			ApplyGridInventoryCursorPolicy();
 			ApplyMeridianCursorPolicy();
 			ApplyMagelightCursorPolicy();
+			ApplyCustomMarkersCursorPolicy();
 		}
 
 		// ---------------------------------------------------------------------------
@@ -1905,6 +2019,194 @@ namespace CursorUnbound
 
 			return (g_partySheetPanels.load(std::memory_order_relaxed) &
 					   PartySheetAPI::kInteractivePanelMask) != 0;
+		}
+
+		// ---------------------------------------------------------------------------
+		// Custom Markers settings panel tracking
+		//
+		// Custom Markers' settings panel (LShift+X) is the same kind of overlay as Party
+		// Sheet's: an ImGui window drawn in Custom Markers' own present hook, not a game menu.
+		// Opened during gameplay it never reaches the menu stack, so MenusWantCursor would stay
+		// false for as long as it is up, while Custom Markers draws its frame-locked arrow over
+		// it from the OS cursor. (Opened over the world map it is covered already: the map's
+		// Cursor Menu has brought us up.)
+		//
+		// Unlike Party Sheet, Custom Markers publishes nothing over SKSE messaging, so the
+		// panel's visibility is read straight out of its module. The flag is
+		// SettingsMenu::g_isVisible, a std::atomic<bool> in .data, and the only code that
+		// reads it is the getter SettingsMenu::IsVisible - so the getter is found from its
+		// call at the end of the present hook's frame, and the flag from the getter:
+		//
+		//   E8 ?? ?? ?? ??                call SettingsMenu::IsVisible
+		//   84 C0 / 74 ??                 test al, al / je
+		//   E8 ?? ?? ?? ??                call ImGui::GetIO
+		//   F3 44 0F 10 80 E0 00 00 00    movss xmm8, [rax+0xE0]   ; io.MousePos.x
+		//   F3 0F 10 B8 E4 00 00 00       movss xmm7, [rax+0xE4]   ; io.MousePos.y
+		//   44 0F 2F C6 / 72 ?? / 0F 2F FE / 73 ??   ; both >= 0
+		//   F3 0F 10 3D ?? ?? ?? ??       movss xmm7, [g_cursorReq.y]
+		//   F3 44 0F 10 05 ?? ?? ?? ??    movss xmm8, [g_cursorReq.x]
+		//   C7 05 ?? ?? ?? ?? 00 00 80 BF mov [g_cursorReq.y], -1.0f
+		//   C7 05 ?? ?? ?? ?? 00 00 80 BF mov [g_cursorReq.x], -1.0f
+		//   44 0F 2F C6 / 72 ?? / 0F 2F FE / 72 ??
+		//   E8 ?? ?? ?? ??                call ImGui::GetForegroundDrawList
+		//   48 8B C8 / 0F 28 D7 / 41 0F 28 C8
+		//   E8 ?? ?? ?? ??                call MapDraw::DrawCursor
+		//
+		// That is the source's "if (SettingsMenu::IsVisible()) RequestCursor(io.MousePos);
+		// DrawRequestedCursor();" with both helpers inlined, and it is the single call site of
+		// the DrawCursor stubbed above. The getter it calls is
+		//
+		//   0F B6 05 <disp32>             movzx eax, byte ptr [rip+g_isVisible]
+		//   90 / C3                       nop / ret
+		//
+		// and every step of following it is checked before the flag is trusted: the call has
+		// to land inside .text, the getter has to be exactly that load-and-return, and the
+		// byte it loads has to sit in a writable section of the module and hold a bool.
+		// Verified against Custom Markers 1.3.4 (link stamp 0x6AF1DCF8), where the call site
+		// is at +0x8DFE6, the getter at +0xFC1F0 and the flag at +0x44F400. Re-check against
+		// every new Custom Markers release; a stale signature leaves the panel with Custom
+		// Markers' own pointer, as before.
+		//
+		// Reading another module's flag from the sync timer is safe for the life of the
+		// process: Custom Markers is an SKSE plugin and is never unloaded, and a one-byte read
+		// cannot tear.
+		// ---------------------------------------------------------------------------
+
+		constexpr int kCustomMarkersPanelSig[] = {
+			0xE8,   -1,   -1,   -1,   -1,
+			0x84, 0xC0,
+			0x74,   -1,
+			0xE8,   -1,   -1,   -1,   -1,
+			0xF3, 0x44, 0x0F, 0x10, 0x80, 0xE0, 0x00, 0x00, 0x00,
+			0xF3, 0x0F, 0x10, 0xB8, 0xE4, 0x00, 0x00, 0x00,
+			0x44, 0x0F, 0x2F, 0xC6,
+			0x72,   -1,
+			0x0F, 0x2F, 0xFE,
+			0x73,   -1,
+			0xF3, 0x0F, 0x10, 0x3D,   -1,   -1,   -1,   -1,
+			0xF3, 0x44, 0x0F, 0x10, 0x05,   -1,   -1,   -1,   -1,
+			0xC7, 0x05,   -1,   -1,   -1,   -1, 0x00, 0x00, 0x80, 0xBF,
+			0xC7, 0x05,   -1,   -1,   -1,   -1, 0x00, 0x00, 0x80, 0xBF,
+			0x44, 0x0F, 0x2F, 0xC6,
+			0x72,   -1,
+			0x0F, 0x2F, 0xFE,
+			0x72,   -1,
+			0xE8,   -1,   -1,   -1,   -1,
+			0x48, 0x8B, 0xC8,
+			0x0F, 0x28, 0xD7,
+			0x41, 0x0F, 0x28, 0xC8,
+			0xE8,   -1,   -1,   -1,   -1,
+		};
+
+		std::atomic<const volatile std::uint8_t*> g_customMarkersPanelVisible{ nullptr };
+
+		bool InWritableSection(const ModuleImage& a_image, std::uint64_t a_rva)
+		{
+			const auto* nt = ModuleHeaders(a_image);
+			const auto* section = IMAGE_FIRST_SECTION(nt);
+			for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+				if (a_rva >= section->VirtualAddress &&
+					a_rva < static_cast<std::uint64_t>(section->VirtualAddress) + section->Misc.VirtualSize) {
+					return (section->Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+				}
+			}
+			return false;
+		}
+
+		void ResolveCustomMarkersPanel()
+		{
+			HMODULE module = ::GetModuleHandleW(g_customMarkersStub.module);
+			if (!module) {
+				return;  // The cursor stub has already said Custom Markers is not loaded.
+			}
+
+			if (!Config::Get().trackCustomMarkersPanel) {
+				SKSE::log::info("Custom Markers' settings panel tracking is turned off.");
+				return;
+			}
+
+			std::uint8_t* text = nullptr;
+			std::size_t   size = 0;
+			ModuleImage   image{};
+			if (!GetTextSection(module, text, size) || !OpenModuleImage(module, image)) {
+				SKSE::log::warn("Custom Markers has no readable .text section; not tracking its "
+								"settings panel.");
+				return;
+			}
+
+			const auto  build = DescribeModuleBuild(module);
+			std::size_t matches = 0;
+			auto* found = FindPattern(
+				text, size, kCustomMarkersPanelSig, std::size(kCustomMarkersPanelSig), matches);
+			if (matches != 1) {
+				SKSE::log::warn(
+					"Custom Markers [{}] - settings-panel signature matched {} time(s), expected "
+					"exactly 1. Its settings panel keeps its own pointer and does not bring up the "
+					"hardware cursor. This normally means the mod has been updated and the "
+					"signature needs revisiting.",
+					build, matches);
+				return;
+			}
+
+			// Everything from here is derived from bytes in somebody else's module, so each
+			// hop is bounds-checked before it is read.
+			std::int32_t rel = 0;
+			std::memcpy(&rel, found + 1, sizeof(rel));
+			auto* getter = found + 5 + rel;
+
+			constexpr std::size_t kGetterLength = 9;  // movzx (7) + nop + ret, at most
+			const bool getterInText = getter >= text && getter < text + size &&
+									  static_cast<std::size_t>(text + size - getter) >= kGetterLength;
+			const bool getterShape = getterInText &&
+									 getter[0] == 0x0F && getter[1] == 0xB6 && getter[2] == 0x05 &&
+									 (getter[7] == 0xC3 || (getter[7] == 0x90 && getter[8] == 0xC3));
+			if (!getterShape) {
+				SKSE::log::warn(
+					"Custom Markers [{}] - the settings panel's visibility getter is not the "
+					"load-and-return it was written for. Its settings panel keeps its own pointer "
+					"and does not bring up the hardware cursor.",
+					build);
+				return;
+			}
+
+			std::int32_t disp = 0;
+			std::memcpy(&disp, getter + 3, sizeof(disp));
+			const auto* flag = getter + 7 + disp;
+
+			const auto rva = flag >= image.base ? static_cast<std::uint64_t>(flag - image.base) : 0;
+			if (flag < image.base || !image.Contains(rva, 1) || !InWritableSection(image, rva) ||
+				*flag > 1) {
+				SKSE::log::warn(
+					"Custom Markers [{}] - the settings panel's visibility flag resolved to "
+					"+0x{:X}, which is not a bool in a writable section of the module. Its "
+					"settings panel keeps its own pointer and does not bring up the hardware "
+					"cursor.",
+					build, rva);
+				return;
+			}
+
+			g_customMarkersPanelVisible.store(flag, std::memory_order_release);
+			SKSE::log::info(
+				"Custom Markers [{}] - resolved its settings panel's visibility flag at +0x{:X} "
+				"(getter +0x{:X}); tracking the panel for cursor activation.",
+				build, rva, static_cast<std::uintptr_t>(getter - image.base));
+		}
+
+		bool CustomMarkersPanelWantsCursor()
+		{
+			if (!Config::Get().trackCustomMarkersPanel) {
+				return false;
+			}
+			const auto* flag = g_customMarkersPanelVisible.load(std::memory_order_acquire);
+			return flag && *flag != 0;
+		}
+
+		// An overlay that is not a game menu but wants a pointer: a Party Sheet panel, or
+		// Custom Markers' settings panel. Neither touches MenuCursor, and both hit-test from
+		// the OS cursor.
+		bool OverlayWantsCursor()
+		{
+			return PartySheetWantsCursor() || CustomMarkersPanelWantsCursor();
 		}
 
 		// ---------------------------------------------------------------------------
@@ -2716,9 +3018,9 @@ namespace CursorUnbound
 
 		bool MenusWantCursor()
 		{
-			// Ahead of the UI singleton deliberately: a Party Sheet panel is not a menu, and
-			// whether the game's menu system is reachable has no bearing on it.
-			if (PartySheetWantsCursor()) {
+			// Ahead of the UI singleton deliberately: a Party Sheet or Custom Markers panel is
+			// not a menu, and whether the game's menu system is reachable has no bearing on it.
+			if (OverlayWantsCursor()) {
 				return true;
 			}
 
@@ -3796,14 +4098,14 @@ namespace CursorUnbound
 
 			const auto& config = Config::Get();
 
-			// Not when a Party Sheet panel is what brought us up. The sync exists to stop the
-			// pointer jumping when a menu opens, by moving the OS cursor to wherever the
-			// game's menu cursor already sits - but a Party Sheet panel is not a game menu and
-			// never touched MenuCursor, so those coordinates are left over from the last real
-			// menu. Syncing to them would cause the jump rather than prevent it, and Party
-			// Sheet places its own hit-testing from the OS position, so there is nothing to
-			// reconcile with in the first place.
-			if (config.syncOnMenuOpen && !PartySheetWantsCursor()) {
+			// Not when a Party Sheet or Custom Markers panel is what brought us up. The sync
+			// exists to stop the pointer jumping when a menu opens, by moving the OS cursor to
+			// wherever the game's menu cursor already sits - but those panels are not game
+			// menus and never touched MenuCursor, so those coordinates are left over from the
+			// last real menu. Syncing to them would cause the jump rather than prevent it, and
+			// both panels hit-test from the OS position, so there is nothing to reconcile with
+			// in the first place.
+			if (config.syncOnMenuOpen && !OverlayWantsCursor()) {
 				SyncOsCursorToGame();
 			}
 
@@ -4244,6 +4546,8 @@ namespace CursorUnbound
 		ResolveCursorStub(g_gridInventoryStub);
 		ResolveCursorStub(g_meridianStub);
 		ResolveCursorStub(g_magelightStub);
+		ResolveCursorStub(g_customMarkersStub);
+		ResolveCustomMarkersPanel();
 		ApplyCursorSuppressionPolicies();
 		ResolveENB();
 
@@ -4266,6 +4570,7 @@ namespace CursorUnbound
 		SetCursorStubSuppressed(g_gridInventoryStub, false);
 		SetCursorStubSuppressed(g_meridianStub, false);
 		SetCursorStubSuppressed(g_magelightStub, false);
+		SetCursorStubSuppressed(g_customMarkersStub, false);
 
 		if (g_window && ::IsWindow(g_window)) {
 			::KillTimer(g_window, kSyncTimerId);
